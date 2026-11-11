@@ -56,13 +56,14 @@ def main() -> int:
     ap.add_argument("--run-vision", required=True)
     ap.add_argument("--atol", type=float, default=2e-3)
     ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--threads", type=int, default=1, help="threads for both runtimes")
     ap.add_argument("models", nargs="+")
     args = ap.parse_args()
 
     failed = False
     for model in args.models:
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
+        opts.intra_op_num_threads = args.threads
         sess = ort.InferenceSession(model, opts, providers=["CPUExecutionProvider"])
         shape = [d if isinstance(d, int) and d > 0 else 1 for d in sess.get_inputs()[0].shape]
         x = photo(shape)
@@ -81,7 +82,7 @@ def main() -> int:
             (tmp / "dims.cfg").write_text(" ".join(map(str, ref.shape)))
             proc = subprocess.run(
                 [args.run_vision, model, str(tmp / "in.bin"), str(tmp / "out.bin"),
-                 str(tmp / "dims.cfg"), str(args.runs)],
+                 str(tmp / "dims.cfg"), str(args.runs), str(args.threads)],
                 capture_output=True, text=True)
             if proc.returncode != 0:
                 print(f"FAIL {Path(model).name}: Ferrite exited {proc.returncode}\n{proc.stderr.strip()}")
@@ -97,7 +98,7 @@ def main() -> int:
               f"max abs diff {diff.max():.2e} ({diff.max() / scale:.1e} of the output range), "
               f"mean {diff.mean():.2e}")
         print(f"     Ferrite      {proc.stdout.strip()}")
-        print(f"     ONNX Runtime best {times[0]:.1f} ms  median {times[len(times) // 2]:.1f} ms  (1 thread)")
+        print(f"     ONNX Runtime best {times[0]:.1f} ms  median {times[len(times) // 2]:.1f} ms  ({args.threads} threads)")
     return 1 if failed else 0
 
 

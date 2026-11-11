@@ -7,7 +7,8 @@
 > **This is Ferrite-DocScanner**, a fork of [Ferrite](https://github.com/AaravGupta17/Ferrite)
 > extended to run the two models in [FlatDocScanner](https://github.com/ogshrug/FlatDocScanner):
 > DocAligner LCNet-100 (page corners) and UVDoc (curved-page flattening). Both load and
-> match ONNX Runtime; see [What the fork adds](#what-the-fork-adds) below.
+> match ONNX Runtime. The fork also adds a NEON backend for 64-bit ARM and optional
+> multithreading; see [What the fork adds](#what-the-fork-adds) below.
 
 **A neural-network inference runtime in 222 KB of C11, with zero dependencies.**
 
@@ -253,11 +254,19 @@ im2col scratch excepted, as before), and loud failure on anything unsupported.
 - The FEMD artifact writer refuses nodes whose new attributes it has no field for,
   rather than dropping them.
 
-**Faster GEMM on AVX2**
+**Faster GEMM, on x86 and ARM**
 
-The old kernel kept a 64-row tile of accumulators "in registers"; AVX2 has 16, so most
-lived in memory and every FMA also paid a load and a store. It is now a 6x16
-register-blocked micro-kernel (12 accumulators) over packed 16-column panels of B.
+The old AVX2 kernel kept a 64-row tile of accumulators "in registers"; AVX2 has 16, so
+most lived in memory and every FMA also paid a load and a store. GEMM is now a 6x16
+register-blocked micro-kernel over packed 16-column panels of B, with the blocking loop
+shared between two backends (`simd/gemm_driver.h`):
+
+- **AVX2** (`simd/matmul_avx2.c`): 12 ymm accumulators.
+- **NEON** (`simd/matmul_neon.c`, new): 24 q-register accumulators on AArch64, plus NEON
+  add, multiply and ReLU. NEON is part of the 64-bit ARM base architecture, so there is
+  no run-time check; CMake picks the backend from the target (AVX2 on x86-64, NEON on
+  AArch64). 32-bit ARM and the Pi Zero keep the scalar backend.
+
 Measured on an AMD Ryzen 5 5600, single-threaded, same machine before and after:
 
 ```sh
@@ -271,11 +280,29 @@ cmake --build build-release --target bench_avx2 bench_model
 | MatMul 256x256x256 | 1.23 ms (27 GFLOPS) | 0.34 ms (100 GFLOPS) |
 | AcousticLeakNet inference | 2.67 ms | 2.32 ms |
 
+**Threads, off by default**
+
+`fe_set_num_threads(n)` (`ops/threads.c`) starts a small worker pool; until it is called
+everything stays on the calling thread, as before. GEMM splits its output columns across
+the pool, convolutions split im2col and depthwise work by channel, and resize and pooling
+split by channel plane. Each element is computed the same way whichever thread computes
+it, so results are bit-identical at every thread count (`test_threads_are_bit_identical`).
+Two callers on different threads don't share the pool; the second simply runs serially.
+Builds without threads (`FERRITE_NO_PARALLEL`, as on ESP32) get a plain loop.
+
+**Other speed-ups**
+
+- Conv followed by Relu is fused at load time into a conv that clamps as it writes
+  (`fe_pass_fuse_conv_relu`): one fewer full pass over memory per pair, and 49 fewer
+  nodes in DocAligner, 28 in UVDoc.
+- Resize works plane by plane in memory order instead of visiting every channel for each
+  output pixel; pooling skips bounds checks for windows inside the image.
+
 **The scanner's models**
 
-`tools/prepare_model.py` rewrites a model into what Ferrite loads, without changing
-what it computes (it checks this against the original before writing): ONNX Runtime's
-basic optimisation folds constants and Conv+BatchNorm, and DocAligner's weighted sums
+`tools/prepare_model.py` rewrites a model into what Ferrite loads, without changing what
+it computes (it checks this against the original before writing): ONNX Runtime's basic
+optimisation folds constants and Conv+BatchNorm, and DocAligner's weighted sums
 (`Unsqueeze` + `Concat` + `Einsum`) become `Mul` and `Add`. `tools/vision_compare.py`
 then runs a model in Ferrite and in ONNX Runtime on the same synthetic photo:
 
@@ -283,21 +310,26 @@ then runs a model in Ferrite and in ONNX Runtime on the same synthetic photo:
 python tools/prepare_model.py docaligner_lcnet100.onnx prep/docaligner_lcnet100.onnx
 python tools/prepare_model.py uvdoc.onnx prep/uvdoc.onnx
 cmake --build build-release --target run_vision
-python tools/vision_compare.py --run-vision build-release/run_vision prep/*.onnx
+python tools/vision_compare.py --run-vision build-release/run_vision --threads 1 prep/*.onnx
+python tools/vision_compare.py --run-vision build-release/run_vision --threads 6 prep/*.onnx
+FERRITE_PROFILE=1 build-release/run_vision ...   # time per operator type
 ```
 
-Ryzen 5 5600, one thread each:
+Ryzen 5 5600, both runtimes given the same number of threads:
 
-| Model | Max difference from ONNX Runtime | Ferrite | ONNX Runtime 1.30 |
-|---|---|---|---|
-| DocAligner LCNet-100, 256x256 | 5.5e-6 | 76 ms | 27 ms |
-| UVDoc, 712x488 | 1.9e-6 | 671 ms | 321 ms |
+| Model | Max difference from ONNX Runtime | Ferrite, 1 thread | ONNX Runtime 1.30, 1 thread | Ferrite, 6 threads | ONNX Runtime, 6 threads |
+|---|---|---|---|---|---|
+| DocAligner LCNet-100, 256x256 | 5.5e-6 | 63 ms | 26 ms | 23 ms | 7 ms |
+| UVDoc, 712x488 | 1.9e-6 | 642 ms | 326 ms | 262 ms | 94 ms |
 
-Before the GEMM change Ferrite took 90 ms and 1464 ms on these. It is still 2 to 3
-times slower than ONNX Runtime, and there is no NEON kernel yet, so on a phone it would
-fall back to scalar code.
+At the start of this work Ferrite could not load either model, and with the first
+operators in place it took 90 ms and 1464 ms single-threaded. It is still 2 to 3 times
+slower than ONNX Runtime. CI runs the same comparison on x86-64 and on a native arm64
+runner (NEON), and the full test suite on arm64 under ASan/UBSan.
 
-`tests/test_vision.c` checks every new kernel against a direct reference.
+`tests/test_vision.c` checks every new kernel against a direct reference, the vector
+GEMM against the scalar one at ragged sizes, fused Conv+Relu against Conv then Relu, and
+thread-count independence.
 
 ---
 

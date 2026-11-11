@@ -138,3 +138,35 @@ FeStatus fe_pass_fuse_conv_bn(FeGraph *g, FeArena *arena) {
     }
     return FE_OK;
 }
+
+/*
+ * Conv + Relu -> one Conv that clamps as it writes its output.
+ *
+ * Saves a full read and write of the activation per fused pair (image models put a
+ * Relu after most convolutions). Fires only when the conv's output is read by the
+ * Relu alone and the Relu's output is read by something (a Relu that is the graph's
+ * output keeps its node, so the output tensor keeps its producer).
+ */
+FeStatus fe_pass_fuse_conv_relu(FeGraph *g) {
+    if (!g) return FE_ERR_NULL;
+    for (int i = 0; i < g->n_nodes; i++) {
+        FeNode *relu = &g->nodes[i];
+        if (relu->op != FE_OP_RELU || relu->n_inputs != 1 || relu->n_outputs != 1) continue;
+        int conv_out = relu->inputs[0];
+        int relu_out = relu->outputs[0];
+        if (count_consumers(g, conv_out) != 1 || count_consumers(g, relu_out) == 0) continue;
+
+        FeNode *conv = NULL;
+        for (int p = 0; p < g->n_nodes && !conv; p++)
+            for (int o = 0; o < g->nodes[p].n_outputs; o++)
+                if (g->nodes[p].outputs[o] == conv_out) { conv = &g->nodes[p]; break; }
+        if (!conv || conv->op != FE_OP_CONV2D || conv->attrs.conv2d.relu) continue;
+
+        conv->attrs.conv2d.relu = 1;
+        conv->outputs[0] = relu_out;
+        relu->op = FE_OP_INPUT;      /* neutered; dead-elim removes it */
+        relu->n_inputs = 0;
+        relu->n_outputs = 0;
+    }
+    return fe_graph_topo_sort(g);
+}

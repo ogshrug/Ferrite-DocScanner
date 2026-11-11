@@ -28,6 +28,7 @@ FeStatus fe_optimize(FeGraph *g, FeArena *weight_arena);
 FeStatus fe_pass_simplify(FeGraph *g);
 FeStatus fe_pass_fold_constants(FeGraph *g, FeArena *arena);
 FeStatus fe_pass_fuse_conv_bn(FeGraph *g, FeArena *arena);
+FeStatus fe_pass_fuse_conv_relu(FeGraph *g);
 FeStatus fe_pass_cse(FeGraph *g);
 FeStatus fe_pass_dead_elim(FeGraph *g);
 

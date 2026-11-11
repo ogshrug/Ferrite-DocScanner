@@ -124,7 +124,8 @@ struct FeNode {
         /* dil_* and groups read as 1 when left at 0, so graphs built by hand
          * with only stride and pad set keep working. */
         struct { int stride_h, stride_w, pad_h, pad_w;
-                 int dil_h, dil_w, groups; }  conv2d;
+                 int dil_h, dil_w, groups;
+                 int relu; /* 1 once a following Relu is fused in */ }  conv2d;
         struct { int kh, kw, sh, sw, ph, pw; } pool;
         struct { int axis; }                 concat;
         /* Output size is out_h x out_w when set, else input size x scale. */

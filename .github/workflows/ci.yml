@@ -177,6 +177,63 @@ jobs:
         run: |
           python3 tools/golden_compare.py --run-model build-golden/run_model
 
+  arm64:
+    # Native 64-bit ARM: the NEON backend, under the sanitizers.
+    name: build + test (arm64 NEON, ASan/UBSan)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFERRITE_SANITIZE=ON
+      - name: Assert the NEON backend and sanitizers are on
+        run: |
+          grep -q "^FERRITE_ENABLE_NEON:BOOL=ON" build/CMakeCache.txt
+          grep -q "^FERRITE_ENABLE_AVX2:BOOL=OFF" build/CMakeCache.txt
+          grep -q "^FERRITE_HAVE_SANITIZERS:INTERNAL=1" build/CMakeCache.txt
+      - name: Build
+        run: cmake --build build
+      - name: Run suite
+        run: ctest --test-dir build --output-on-failure
+
+  scanner-models:
+    # FlatDocScanner's two models through Ferrite and ONNX Runtime on the same
+    # input, on x86-64 (AVX2) and arm64 (NEON), at one thread and at four.
+    name: scanner models vs ONNX Runtime (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ninja + python deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build python3-pip python3-venv
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet onnxruntime onnx numpy
+      - name: Fetch and prepare the models
+        run: |
+          mkdir -p models
+          base=https://raw.githubusercontent.com/ogshrug/FlatDocScanner/main/app/src/main/assets
+          for m in docaligner_lcnet100 uvdoc; do
+            curl -sSfL -o models/$m.onnx "$base/$m.onnx"
+            .venv/bin/python tools/prepare_model.py models/$m.onnx models/$m.prep.onnx
+          done
+      - name: Build run_vision
+        run: |
+          cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DFERRITE_SANITIZE=OFF
+          cmake --build build-rel --target run_vision
+      - name: Compare, one thread
+        run: .venv/bin/python tools/vision_compare.py --run-vision build-rel/run_vision --runs 3 --threads 1 models/*.prep.onnx
+      - name: Compare, four threads
+        run: .venv/bin/python tools/vision_compare.py --run-vision build-rel/run_vision --runs 3 --threads 4 models/*.prep.onnx
+
   coverage:
     name: coverage gate (gcov)
     runs-on: ubuntu-latest

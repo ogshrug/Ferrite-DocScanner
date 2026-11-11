@@ -1,6 +1,6 @@
 /* ops/conv2d.c — 2D convolution (Stage 3, CNN family).
  *
- * Three paths, picked per call:
+ * Three paths, picked per call, each split across the thread pool (ops/threads.c):
  *   - depthwise (groups == C_in, one input channel per filter): direct accumulation,
  *     one kernel tap at a time, with no scratch buffer;
  *   - 1x1, stride 1, no padding: the input already is the im2col matrix, so it goes
@@ -33,15 +33,23 @@ static void valid_range(int out_n, int stride, int off, int n, int *lo, int *hi)
 /* Build the im2col matrix for C channels starting at `src`:
  *   col: [C*KH*KW, OH*OW], col[r, oh*OW+ow] = src[c, oh*sh + i*dh - ph, ow*sw + j*dw - pw]
  * out-of-bounds reads (padding) yield 0. */
-static void im2col2d(const float *src, float *col, int C, int H, int W,
-                     int KH, int KW, int OH, int OW,
-                     int sh, int sw, int ph, int pw, int dh, int dw) {
-    size_t plane = (size_t)OH * OW;
-    memset(col, 0, (size_t)C * KH * KW * plane * sizeof(float));
+typedef struct {
+    const float *src;
+    float *col;
+    int H, W, KH, KW, OH, OW, sh, sw, ph, pw, dh, dw;
+} Im2col;
 
-    size_t r = 0;
-    for (int c = 0; c < C; c++) {
-        const float *chan = src + (size_t)c * H * W;
+/* The KH*KW rows of the im2col matrix that come from input channel c. */
+static void im2col_channel(void *p, int c) {
+    const Im2col *q = (const Im2col *)p;
+    int H = q->H, W = q->W, KH = q->KH, KW = q->KW, OH = q->OH, OW = q->OW;
+    int sh = q->sh, sw = q->sw, ph = q->ph, pw = q->pw, dh = q->dh, dw = q->dw;
+    size_t plane = (size_t)OH * OW;
+    float *col = q->col;
+    memset(col + (size_t)c * KH * KW * plane, 0, (size_t)KH * KW * plane * sizeof(float));
+    size_t r = (size_t)c * KH * KW;
+    {
+        const float *chan = q->src + (size_t)c * H * W;
         for (int i = 0; i < KH; i++) {
             int oh_lo, oh_hi;
             valid_range(OH, sh, i * dh - ph, H, &oh_lo, &oh_hi);
@@ -75,11 +83,22 @@ static void view2d(FeTensor *t, float *data, int rows, int cols) {
 /* Depthwise: every output channel reads exactly one input channel. Each kernel tap
  * adds a scaled, shifted copy of the input plane to the output plane, which the
  * compiler vectorises when the stride is 1. */
-static void depthwise(const float *in, const float *w, const float *bias, float *out,
-                      int C_in, int mult, int H, int W, int KH, int KW,
-                      int OH, int OW, int sh, int sw, int ph, int pw, int dh, int dw) {
+typedef struct {
+    const float *in, *w, *bias;
+    float *out;
+    int mult, H, W, KH, KW, OH, OW, sh, sw, ph, pw, dh, dw, relu;
+} Depthwise;
+
+/* One input channel and the mult output channels it feeds. */
+static void depthwise_channel(void *p, int c) {
+    const Depthwise *q = (const Depthwise *)p;
+    const float *in = q->in, *w = q->w, *bias = q->bias;
+    float *out = q->out;
+    int mult = q->mult, H = q->H, W = q->W, KH = q->KH, KW = q->KW;
+    int OH = q->OH, OW = q->OW, sh = q->sh, sw = q->sw, ph = q->ph, pw = q->pw;
+    int dh = q->dh, dw = q->dw;
     size_t plane = (size_t)OH * OW;
-    for (int c = 0; c < C_in; c++) {
+    {
         const float *chan = in + (size_t)c * H * W;
         for (int m = 0; m < mult; m++) {
             int oc = c * mult + m;
@@ -106,6 +125,8 @@ static void depthwise(const float *in, const float *w, const float *bias, float 
                     }
                 }
             }
+            if (q->relu)
+                for (size_t k = 0; k < plane; k++) o[k] = o[k] > 0.0f ? o[k] : 0.0f;
         }
     }
 }
@@ -113,7 +134,7 @@ static void depthwise(const float *in, const float *w, const float *bias, float 
 FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
                       const FeTensor *bias, FeTensor *out,
                       int sh, int sw, int ph, int pw,
-                      int dh, int dw, int groups) {
+                      int dh, int dw, int groups, int relu) {
     if (!input || !weight || !out) return FE_ERR_NULL;
     if (input->ndim  != 4) return FE_ERR_SHAPE;
     if (weight->ndim != 4) return FE_ERR_SHAPE;
@@ -147,11 +168,13 @@ FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
     size_t in_plane = (size_t)H * W, out_plane = (size_t)OH * OW;
 
     if (Cg == 1 && groups == C_in) {
-        for (int n = 0; n < N; n++)
-            depthwise(in_data + (size_t)n * C_in * in_plane, w_data, b_data,
-                      out_data + (size_t)n * C_out * out_plane,
-                      C_in, C_out / C_in, H, W, KH, KW, OH, OW,
-                      sh, sw, ph, pw, dh, dw);
+        for (int n = 0; n < N; n++) {
+            Depthwise q = { in_data + (size_t)n * C_in * in_plane, w_data, b_data,
+                            out_data + (size_t)n * C_out * out_plane,
+                            C_out / C_in, H, W, KH, KW, OH, OW,
+                            sh, sw, ph, pw, dh, dw, relu };
+            fe_parallel_for(C_in, depthwise_channel, &q);
+        }
         return FE_OK;
     }
 
@@ -174,7 +197,8 @@ FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
                 /* Read-only: GEMM never writes its inputs. */
                 view2d(&colT, (float *)(size_t)src, K, (int)out_plane);
             } else {
-                im2col2d(src, col, Cg, H, W, KH, KW, OH, OW, sh, sw, ph, pw, dh, dw);
+                Im2col q = { src, col, H, W, KH, KW, OH, OW, sh, sw, ph, pw, dh, dw };
+                fe_parallel_for(Cg, im2col_channel, &q);
                 view2d(&colT, col, K, (int)out_plane);
             }
             view2d(&Wview, (float *)(size_t)(w_data + (size_t)g * Og * K), Og, K);
@@ -184,11 +208,17 @@ FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
             s = fe_matmul(&Wview, &colT, &out_slice);
             if (s != FE_OK) break;
 
-            if (b_data) {
+            if (b_data || relu) {
                 for (int oc = 0; oc < Og; oc++) {
-                    float b = b_data[g * Og + oc];
+                    float b = b_data ? b_data[g * Og + oc] : 0.0f;
                     float *row = o + (size_t)oc * out_plane;
-                    for (size_t px = 0; px < out_plane; px++) row[px] += b;
+                    if (relu)
+                        for (size_t px = 0; px < out_plane; px++) {
+                            float v = row[px] + b;
+                            row[px] = v > 0.0f ? v : 0.0f;
+                        }
+                    else
+                        for (size_t px = 0; px < out_plane; px++) row[px] += b;
                 }
             }
         }
@@ -201,5 +231,5 @@ FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
 FeStatus fe_conv2d(const FeTensor *input, const FeTensor *weight,
                    const FeTensor *bias, FeTensor *out,
                    int sh, int sw, int ph, int pw) {
-    return fe_conv2d_ex(input, weight, bias, out, sh, sw, ph, pw, 1, 1, 1);
+    return fe_conv2d_ex(input, weight, bias, out, sh, sw, ph, pw, 1, 1, 1, 0);
 }

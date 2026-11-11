@@ -359,7 +359,7 @@ static FeStatus ex_conv2d(FeRuntime *rt, FeNode *node) {
                               OUT(0),
                               node->attrs.conv2d.stride_h, node->attrs.conv2d.stride_w,
                               node->attrs.conv2d.pad_h,    node->attrs.conv2d.pad_w,
-                              dh, dw, groups);
+                              dh, dw, groups, node->attrs.conv2d.relu);
     EXEC_END();
     return s;
 }
@@ -450,7 +450,7 @@ static FeStatus ex_posenc(FeRuntime *rt, FeNode *node) {
 static FeStatus ex_concat(FeRuntime *rt, FeNode *node) {
     FeGraph *g = rt->graph;
     EXEC_BEGIN();
-    const FeTensor *ins[FE_MAX_NODE_INPUTS];
+    const FeTensor *ins[FE_MAX_NODE_INPUTS] = {0};
     for (int i = 0; i < node->n_inputs; i++) ins[i] = IN(i);
     FeStatus s = fe_concat(ins, node->n_inputs, node->attrs.concat.axis, OUT(0));
     EXEC_END();

@@ -15,7 +15,7 @@
 typedef enum {
     FE_SIMD_SCALAR = 0,   /* reference/portable kernels everywhere        */
     FE_SIMD_AVX2,         /* x86-64 AVX2 + FMA, CPUID-gated               */
-    FE_SIMD_NEON          /* ARM NEON (reserved, Section 4.1)             */
+    FE_SIMD_NEON          /* AArch64 NEON, compile-time (always present)  */
 } FeSimdBackend;
 
 /* One dispatch table per op family. `matmul` validates and runs the fast
@@ -23,6 +23,11 @@ typedef enum {
  * The buffer-level kernels are hot path — callers already validated. */
 typedef struct {
     FeStatus (*matmul)(const FeTensor *A, const FeTensor *B, FeTensor *C);
+    /* Raw-pointer GEMM with leading dimensions: overwrites the M x N block of c
+     * with a @ b. NULL in the scalar table. Lets callers run a column range of
+     * a larger product, which is how fe_matmul spreads work across threads. */
+    void (*gemm)(const float *a, int lda, const float *b, int ldb,
+                 float *c, int ldc, int M, int N, int K);
     void (*relu)(const float *in, float *out, int n);
     void (*add) (const float *a, const float *b, float *out, int n);
     void (*mul) (const float *a, const float *b, float *out, int n);

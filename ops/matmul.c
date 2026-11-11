@@ -69,6 +69,46 @@ FeStatus fe_matmul_scalar(const FeTensor *A, const FeTensor *B, FeTensor *C) {
  * path returns anything other than FE_OK. New backends (NEON) slot in via
  * the table without touching ops/.
  */
+/*
+ * The vector GEMM, spread over the thread pool by columns of C. Each task owns a
+ * run of columns that is a multiple of 16 wide (the kernel's block width), and
+ * every element is summed in the same order whoever computes it, so the result
+ * does not depend on the thread count. Small products stay on one thread: below
+ * roughly a million multiply-adds, waking workers costs more than it saves.
+ */
+typedef struct {
+    const FeSimdOps *ops;
+    const float *a, *b;
+    float *c;
+    int M, N, K, cols_per_task;
+} GemmSplit;
+
+static void gemm_task(void *p, int t) {
+    const GemmSplit *g = (const GemmSplit *)p;
+    int n0 = t * g->cols_per_task;
+    int n = g->N - n0 < g->cols_per_task ? g->N - n0 : g->cols_per_task;
+    if (n > 0)
+        g->ops->gemm(g->a, g->K, g->b + n0, g->N, g->c + n0, g->N, g->M, n, g->K);
+}
+
+static void gemm_split(const FeSimdOps *ops, const FeTensor *A, const FeTensor *B,
+                       FeTensor *C) {
+    GemmSplit g = { ops, (const float *)A->data, (const float *)B->data,
+                    (float *)C->data, A->shape[0], B->shape[1], A->shape[1], 0 };
+    int threads = fe_get_num_threads();
+    double work = (double)g.M * g.N * g.K;
+    if (threads <= 1 || work < 1e6 || g.N < 64) {
+        ops->gemm(g.a, g.K, g.b, g.N, g.c, g.N, g.M, g.N, g.K);
+        return;
+    }
+    /* About four tasks per thread, so a slow core doesn't hold everyone up. */
+    int tasks = threads * 4;
+    int per = (g.N + tasks - 1) / tasks;
+    per = (per + 15) / 16 * 16;
+    g.cols_per_task = per;
+    fe_parallel_for((g.N + per - 1) / per, gemm_task, &g);
+}
+
 FeStatus fe_matmul(const FeTensor *A, const FeTensor *B, FeTensor *C) {
     /*
      * The active SIMD backend's tiled kernel packs an MC=64-row tile of A
@@ -88,6 +128,16 @@ FeStatus fe_matmul(const FeTensor *A, const FeTensor *B, FeTensor *C) {
     }
 
     const FeSimdOps *ops = fe_simd_ops();
+    if (ops->gemm && A && B && C && A->ndim == 2 && B->ndim == 2 && C->ndim == 2 &&
+        A->dtype == DTYPE_FLOAT32 && B->dtype == DTYPE_FLOAT32 &&
+        C->dtype == DTYPE_FLOAT32 &&
+        B->shape[0] == A->shape[1] && C->shape[0] == A->shape[0] &&
+        C->shape[1] == B->shape[1] &&
+        fe_tensor_is_contiguous(A) && fe_tensor_is_contiguous(B) &&
+        fe_tensor_is_contiguous(C)) {
+        gemm_split(ops, A, B, C);
+        return FE_OK;
+    }
     if (ops->matmul) {
         FeStatus s = ops->matmul(A, B, C);
         if (s == FE_OK) return s;

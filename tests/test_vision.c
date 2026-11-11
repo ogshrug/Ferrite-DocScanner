@@ -68,7 +68,7 @@ static void check_conv(int C, int H, int W, int O, int K, int s, int p, int d, i
     fill(in, 1); fill(w, 2); fill(b, 3);
     int OH = (H + 2 * p - (d * (K - 1) + 1)) / s + 1, OW = (W + 2 * p - (d * (K - 1) + 1)) / s + 1;
     FeTensor *got = make(1, O, OH, OW), *ref = make(1, O, OH, OW);
-    assert(fe_conv2d_ex(in, w, b, got, s, s, p, p, d, d, groups) == FE_OK);
+    assert(fe_conv2d_ex(in, w, b, got, s, s, p, p, d, d, groups, 0) == FE_OK);
     conv_ref(in, w, b, ref, s, s, p, p, d, d, groups);
     float diff = max_diff(got, ref);
     if (diff > 1e-4f) printf("  %s: max diff %g\n", what, diff);
@@ -92,8 +92,8 @@ static void test_conv_paths(void) {
 static void test_conv_rejects_bad_groups(void) {
     FeTensor *in = make(1, 6, 5, 5), *w = make(4, 2, 3, 3), *out = make(1, 4, 5, 5);
     fill(in, 4); fill(w, 5);
-    assert(fe_conv2d_ex(in, w, NULL, out, 1, 1, 1, 1, 1, 1, 2) == FE_ERR_SHAPE);  /* 2*2 != 6 */
-    assert(fe_conv2d_ex(in, w, NULL, out, 1, 1, 1, 1, 0, 1, 3) == FE_ERR_SHAPE);  /* dilation 0 */
+    assert(fe_conv2d_ex(in, w, NULL, out, 1, 1, 1, 1, 1, 1, 2, 0) == FE_ERR_SHAPE);  /* 2*2 != 6 */
+    assert(fe_conv2d_ex(in, w, NULL, out, 1, 1, 1, 1, 0, 1, 3, 0) == FE_ERR_SHAPE);  /* dilation 0 */
     fe_tensor_free(in); fe_tensor_free(w); fe_tensor_free(out);
     printf("PASS test_conv_rejects_bad_groups\n");
 }
@@ -224,6 +224,91 @@ static void test_small_ops(void) {
     printf("PASS test_small_ops\n");
 }
 
+/* The vector GEMM (AVX2 or NEON, whichever this build has) against the scalar
+ * reference, at sizes that leave ragged edges in every dimension. */
+static void test_gemm_matches_scalar(void) {
+    int sizes[][3] = { {1, 1, 1}, {5, 7, 3}, {6, 16, 256}, {7, 17, 257},
+                       {13, 33, 520}, {64, 100, 75}, {3, 1000, 9} };
+    for (size_t t = 0; t < sizeof sizes / sizeof sizes[0]; t++) {
+        int M = sizes[t][0], N = sizes[t][1], K = sizes[t][2];
+        int as[2] = {M, K}, bs[2] = {K, N}, cs[2] = {M, N};
+        FeTensor *A = fe_tensor_alloc(DTYPE_FLOAT32, 2, as);
+        FeTensor *B = fe_tensor_alloc(DTYPE_FLOAT32, 2, bs);
+        FeTensor *C = fe_tensor_alloc(DTYPE_FLOAT32, 2, cs);
+        FeTensor *R = fe_tensor_alloc(DTYPE_FLOAT32, 2, cs);
+        fill(A, 20 + (unsigned)t); fill(B, 40 + (unsigned)t);
+        assert(fe_matmul(A, B, C) == FE_OK);
+        assert(fe_matmul_scalar(A, B, R) == FE_OK);
+        float tol = 1e-5f * (float)K;
+        if (max_diff(C, R) > tol) printf("  %dx%dx%d: max diff %g\n", M, N, K, max_diff(C, R));
+        assert(max_diff(C, R) <= tol);
+        fe_tensor_free(A); fe_tensor_free(B); fe_tensor_free(C); fe_tensor_free(R);
+    }
+    printf("PASS test_gemm_matches_scalar\n");
+}
+
+/* Splitting work across threads must not change a single bit of the result. */
+static void test_threads_are_bit_identical(void) {
+    int as[2] = {37, 300}, bs[2] = {300, 1500}, cs[2] = {37, 1500};
+    FeTensor *A = fe_tensor_alloc(DTYPE_FLOAT32, 2, as);
+    FeTensor *B = fe_tensor_alloc(DTYPE_FLOAT32, 2, bs);
+    FeTensor *one = fe_tensor_alloc(DTYPE_FLOAT32, 2, cs);
+    FeTensor *many = fe_tensor_alloc(DTYPE_FLOAT32, 2, cs);
+    fill(A, 60); fill(B, 61);
+    fe_set_num_threads(1);
+    assert(fe_matmul(A, B, one) == FE_OK);
+
+    FeTensor *in = make(1, 24, 33, 35), *w = make(32, 24, 3, 3), *dw = make(24, 1, 5, 5);
+    fill(in, 62); fill(w, 63); fill(dw, 64);
+    FeTensor *c1 = make(1, 32, 17, 18), *cN = make(1, 32, 17, 18);
+    FeTensor *d1 = make(1, 24, 33, 35), *dN = make(1, 24, 33, 35);
+    assert(fe_conv2d_ex(in, w, NULL, c1, 2, 2, 1, 1, 1, 1, 1, 1) == FE_OK);
+    assert(fe_conv2d_ex(in, dw, NULL, d1, 1, 1, 2, 2, 1, 1, 24, 0) == FE_OK);
+
+    fe_set_num_threads(4);
+#ifndef FERRITE_NO_PARALLEL
+    assert(fe_get_num_threads() == 4);
+#endif
+    for (int rep = 0; rep < 3; rep++) {
+        assert(fe_matmul(A, B, many) == FE_OK);
+        assert(memcmp(one->data, many->data, one->nbytes) == 0);
+        assert(fe_conv2d_ex(in, w, NULL, cN, 2, 2, 1, 1, 1, 1, 1, 1) == FE_OK);
+        assert(memcmp(c1->data, cN->data, c1->nbytes) == 0);
+        assert(fe_conv2d_ex(in, dw, NULL, dN, 1, 1, 2, 2, 1, 1, 24, 0) == FE_OK);
+        assert(memcmp(d1->data, dN->data, d1->nbytes) == 0);
+    }
+    fe_set_num_threads(1);
+    assert(fe_get_num_threads() == 1);
+    fe_tensor_free(A); fe_tensor_free(B); fe_tensor_free(one); fe_tensor_free(many);
+    fe_tensor_free(in); fe_tensor_free(w); fe_tensor_free(dw);
+    fe_tensor_free(c1); fe_tensor_free(cN); fe_tensor_free(d1); fe_tensor_free(dN);
+    printf("PASS test_threads_are_bit_identical\n");
+}
+
+/* A fused Conv+Relu gives exactly Conv followed by Relu, on every conv path. */
+static void test_fused_relu(void) {
+    struct { int C, O, K, s, p, d, groups; } cases[] = {
+        {6, 8, 3, 1, 1, 1, 1}, {8, 8, 1, 1, 0, 1, 1}, {8, 8, 5, 2, 2, 1, 8}, {4, 6, 3, 1, 2, 2, 2},
+    };
+    for (size_t t = 0; t < sizeof cases / sizeof cases[0]; t++) {
+        int C = cases[t].C, O = cases[t].O, K = cases[t].K, s = cases[t].s;
+        int p = cases[t].p, d = cases[t].d, gr = cases[t].groups;
+        FeTensor *in = make(1, C, 14, 15), *w = make(O, C / gr, K, K);
+        int bs[1] = {O};
+        FeTensor *b = fe_tensor_alloc(DTYPE_FLOAT32, 1, bs);
+        fill(in, 70); fill(w, 71); fill(b, 72);
+        int OH = (14 + 2 * p - (d * (K - 1) + 1)) / s + 1, OW = (15 + 2 * p - (d * (K - 1) + 1)) / s + 1;
+        FeTensor *plain = make(1, O, OH, OW), *fused = make(1, O, OH, OW);
+        assert(fe_conv2d_ex(in, w, b, plain, s, s, p, p, d, d, gr, 0) == FE_OK);
+        assert(fe_relu(plain, plain) == FE_OK);
+        assert(fe_conv2d_ex(in, w, b, fused, s, s, p, p, d, d, gr, 1) == FE_OK);
+        assert(memcmp(plain->data, fused->data, plain->nbytes) == 0);
+        fe_tensor_free(in); fe_tensor_free(w); fe_tensor_free(b);
+        fe_tensor_free(plain); fe_tensor_free(fused);
+    }
+    printf("PASS test_fused_relu\n");
+}
+
 int main(void) {
     test_conv_paths();
     test_conv_rejects_bad_groups();
@@ -233,5 +318,8 @@ int main(void) {
     test_resize();
     test_pad();
     test_small_ops();
+    test_gemm_matches_scalar();
+    test_threads_are_bit_identical();
+    test_fused_relu();
     return 0;
 }

@@ -121,7 +121,7 @@ static FeStatus write_attrs(FILE *f, const FeNode *n) {
     if (n->op >= FE_OP_CONCAT) return FE_ERR_DTYPE;
     if (n->op == FE_OP_CONV2D &&
         (n->attrs.conv2d.dil_h > 1 || n->attrs.conv2d.dil_w > 1 ||
-         n->attrs.conv2d.groups > 1)) return FE_ERR_DTYPE;
+         n->attrs.conv2d.groups > 1 || n->attrs.conv2d.relu)) return FE_ERR_DTYPE;
     if ((n->op == FE_OP_MAXPOOL || n->op == FE_OP_AVGPOOL) &&
         (n->attrs.pool.ph > 0 || n->attrs.pool.pw > 0)) return FE_ERR_DTYPE;
     switch (n->op) {

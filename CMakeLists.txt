@@ -48,8 +48,20 @@ option(FERRITE_ENABLE_COMPILER  "Host: stage-14 linear IR"        ON)
 option(FERRITE_ENABLE_PARALLEL  "Host: thread pool + DAG"         ON)
 option(FERRITE_ENABLE_QUANT     "Quantization kernels + engine"   ON)
 option(FERRITE_ENABLE_PROFILER  "Timing profiler (POSIX clock)"   ON)
-option(FERRITE_ENABLE_AVX2      "x86 AVX2 SIMD backend"           ON)
-option(FERRITE_ENABLE_NEON      "ARM NEON SIMD backend"           OFF)
+# The vector backend follows the target: AVX2 on x86-64, NEON on AArch64.
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" FERRITE_PROC_LOWER)
+if(FERRITE_PROC_LOWER MATCHES "^(x86_64|amd64|x64|i[3-6]86)$")
+    set(FERRITE_AVX2_DEFAULT ON)
+else()
+    set(FERRITE_AVX2_DEFAULT OFF)
+endif()
+if(FERRITE_PROC_LOWER MATCHES "^(aarch64|arm64)$")
+    set(FERRITE_NEON_DEFAULT ON)
+else()
+    set(FERRITE_NEON_DEFAULT OFF)
+endif()
+option(FERRITE_ENABLE_AVX2      "x86 AVX2 SIMD backend"           ${FERRITE_AVX2_DEFAULT})
+option(FERRITE_ENABLE_NEON      "AArch64 NEON SIMD backend"       ${FERRITE_NEON_DEFAULT})
 option(FERRITE_ENABLE_FLOAT64   "Double-precision tensor support" ON)
 
 foreach(subsys IMPORTER OPTIM COMPILER PARALLEL QUANT PROFILER AVX2 NEON)
@@ -64,8 +76,11 @@ endif()
 
 # x86 check (Section 3): the only SIMD backend today is AVX2. Requesting it on
 # a non-x86 target is a configuration error, not a silent scalar downgrade.
+if(FERRITE_ENABLE_NEON AND NOT FERRITE_PROC_LOWER MATCHES "^(aarch64|arm64)$")
+    message(FATAL_ERROR "FERRITE_ENABLE_NEON=ON needs an AArch64 target, "
+                        "not ${CMAKE_SYSTEM_PROCESSOR}.")
+endif()
 if(FERRITE_ENABLE_AVX2)
-    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" FERRITE_PROC_LOWER)
     if(FERRITE_PROC_LOWER MATCHES "aarch64|arm|riscv|mips|ppc")
         message(FATAL_ERROR
             "FERRITE_ENABLE_AVX2=ON on ${CMAKE_SYSTEM_PROCESSOR}, but AVX2 is "
@@ -194,6 +209,10 @@ if(FERRITE_ENABLE_AVX2)
     )
     target_compile_options(ferrite_simd PRIVATE -O3 -mavx2 -mfma)
 endif()
+if(FERRITE_ENABLE_NEON)
+    target_sources(ferrite_simd PRIVATE simd/matmul_neon.c)
+    target_compile_options(ferrite_simd PRIVATE -O3)
+endif()
 target_link_libraries(ferrite_simd PUBLIC ferrite_core)
 
 add_library(ferrite_ops STATIC
@@ -211,6 +230,7 @@ add_library(ferrite_ops STATIC
     ops/sequence.c
     ops/stability.c
     ops/vision.c
+    ops/threads.c
 )
 target_link_libraries(ferrite_ops PUBLIC ferrite_core ferrite_simd)
 

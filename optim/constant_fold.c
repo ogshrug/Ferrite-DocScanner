@@ -102,7 +102,8 @@ static FeStatus fold_node(FeGraph *g, FeNode *node, FeArena *arena) {
                              node->attrs.conv2d.pad_h,    node->attrs.conv2d.pad_w,
                              node->attrs.conv2d.dil_h > 0 ? node->attrs.conv2d.dil_h : 1,
                              node->attrs.conv2d.dil_w > 0 ? node->attrs.conv2d.dil_w : 1,
-                             node->attrs.conv2d.groups > 0 ? node->attrs.conv2d.groups : 1);
+                             node->attrs.conv2d.groups > 0 ? node->attrs.conv2d.groups : 1,
+                             node->attrs.conv2d.relu);
             break;
         case FE_OP_MAXPOOL:
             s = fe_maxpool_pad(IN(0), OUT(0), node->attrs.pool.kh, node->attrs.pool.kw,

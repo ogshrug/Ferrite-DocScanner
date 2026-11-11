@@ -56,6 +56,41 @@ static float resize_coord(int o, int in, int out, int coord_mode) {
     return ((float)o + 0.5f) * scale - 0.5f;          /* half_pixel */
 }
 
+typedef struct {
+    const float *src;
+    float *dst;
+    int H, W, OH, OW, coord;
+} Resize;
+
+/* One channel plane, row by row: reads two input rows, writes one output row. */
+static void resize_plane(void *p, int plane) {
+    const Resize *q = (const Resize *)p;
+    int H = q->H, W = q->W, OH = q->OH, OW = q->OW;
+    const float *s = q->src + (size_t)plane * H * W;
+    float *d = q->dst + (size_t)plane * OH * OW;
+    for (int oy = 0; oy < OH; oy++) {
+        float fy = resize_coord(oy, H, OH, q->coord);
+        if (fy < 0.0f) fy = 0.0f;
+        if (fy > (float)(H - 1)) fy = (float)(H - 1);
+        int y0 = (int)fy;
+        int y1 = y0 + 1 < H ? y0 + 1 : y0;
+        float wy = fy - (float)y0;
+        const float *r0 = s + (size_t)y0 * W, *r1 = s + (size_t)y1 * W;
+        float *row = d + (size_t)oy * OW;
+        for (int ox = 0; ox < OW; ox++) {
+            float fx = resize_coord(ox, W, OW, q->coord);
+            if (fx < 0.0f) fx = 0.0f;
+            if (fx > (float)(W - 1)) fx = (float)(W - 1);
+            int x0 = (int)fx;
+            int x1 = x0 + 1 < W ? x0 + 1 : x0;
+            float wx = fx - (float)x0;
+            /* Same products, in the same order, as the per-pixel form. */
+            row[ox] = (1.0f - wy) * (1.0f - wx) * r0[x0] + (1.0f - wy) * wx * r0[x1] +
+                      wy * (1.0f - wx) * r1[x0] + wy * wx * r1[x1];
+        }
+    }
+}
+
 FeStatus fe_resize_bilinear(const FeTensor *in, FeTensor *out, int coord_mode) {
     if (!in || !out) return FE_ERR_NULL;
     if (in->ndim != 4 || out->ndim != 4) return FE_ERR_SHAPE;
@@ -66,37 +101,10 @@ FeStatus fe_resize_bilinear(const FeTensor *in, FeTensor *out, int coord_mode) {
         return FE_ERR_SHAPE;
 
     int planes = in->shape[0] * in->shape[1];
-    int H = in->shape[2], W = in->shape[3];
-    int OH = out->shape[2], OW = out->shape[3];
-    if (H < 1 || W < 1 || OH < 1 || OW < 1) return FE_ERR_SHAPE;
-
-    const float *src = (const float *)in->data;
-    float *dst = (float *)out->data;
-
-    for (int oy = 0; oy < OH; oy++) {
-        float fy = resize_coord(oy, H, OH, coord_mode);
-        if (fy < 0.0f) fy = 0.0f;
-        if (fy > (float)(H - 1)) fy = (float)(H - 1);
-        int y0 = (int)fy;
-        int y1 = y0 + 1 < H ? y0 + 1 : y0;
-        float wy = fy - (float)y0;
-        for (int ox = 0; ox < OW; ox++) {
-            float fx = resize_coord(ox, W, OW, coord_mode);
-            if (fx < 0.0f) fx = 0.0f;
-            if (fx > (float)(W - 1)) fx = (float)(W - 1);
-            int x0 = (int)fx;
-            int x1 = x0 + 1 < W ? x0 + 1 : x0;
-            float wx = fx - (float)x0;
-            float w00 = (1.0f - wy) * (1.0f - wx), w01 = (1.0f - wy) * wx;
-            float w10 = wy * (1.0f - wx),          w11 = wy * wx;
-            for (int p = 0; p < planes; p++) {
-                const float *s = src + (size_t)p * H * W;
-                dst[((size_t)p * OH + oy) * OW + ox] =
-                    w00 * s[y0 * W + x0] + w01 * s[y0 * W + x1] +
-                    w10 * s[y1 * W + x0] + w11 * s[y1 * W + x1];
-            }
-        }
-    }
+    Resize q = { (const float *)in->data, (float *)out->data,
+                 in->shape[2], in->shape[3], out->shape[2], out->shape[3], coord_mode };
+    if (q.H < 1 || q.W < 1 || q.OH < 1 || q.OW < 1) return FE_ERR_SHAPE;
+    fe_parallel_for(planes, resize_plane, &q);
     return FE_OK;
 }
 

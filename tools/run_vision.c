@@ -1,15 +1,17 @@
 /*
  * tools/run_vision.c — runs an image model end to end and times it.
  *
- *   run_vision <model.onnx> <input.bin> <output.bin> <out_dims.cfg> [runs]
+ *   run_vision <model.onnx> <input.bin> <output.bin> <out_dims.cfg> [runs] [threads]
  *
  * Same file formats as run_model (FRT1 tensors, whitespace-separated output dims),
  * but the buffers are heap-allocated and sized for image models: tens of megabytes
  * of weights and hundreds of megabytes of activations at full resolution, far more
  * than run_model's static buffers hold. Prints load time and the best and median
- * of `runs` timed inferences (default 5) after one warm-up run.
+ * of `runs` timed inferences (default 5) after one warm-up run, on `threads`
+ * threads (default 1).
  *
- * Drives tools/vision_compare.py.
+ * Drives tools/vision_compare.py. With FERRITE_PROFILE=1 in the environment it also
+ * prints the time spent per operator type over the timed runs.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +22,9 @@
 #include "../graph/graph.h"
 #include "../runtime/engine.h"
 #include "../importer/onnx.h"
+#include "../ops/ops.h"
 #include "../tools/bench.h"
+#include "../tools/profiler.h"
 
 #define WEIGHT_BUF_SIZE ((size_t)160 << 20)
 #define ACT_BUF_SIZE    ((size_t)1536 << 20)
@@ -72,13 +76,14 @@ static int cmp_double(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5 || argc > 6) {
+    if (argc < 5 || argc > 7) {
         fprintf(stderr, "usage: run_vision <model.onnx> <input.bin> <output.bin> "
-                        "<out_dims.cfg> [runs]\n");
+                        "<out_dims.cfg> [runs] [threads]\n");
         return 2;
     }
-    int runs = argc == 6 ? atoi(argv[5]) : 5;
+    int runs = argc >= 6 ? atoi(argv[5]) : 5;
     if (runs < 1) runs = 1;
+    fe_set_num_threads(argc >= 7 ? atoi(argv[6]) : 1);
 
     FeTensor *input = read_bin(argv[2]);
     if (!input) { fprintf(stderr, "run_vision: cannot read %s\n", argv[2]); return 1; }
@@ -112,6 +117,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Profile by operator type: the profiler keys on node names, so name each node
+     * after its op (it has room for 64 names, fewer than most image models' nodes). */
+    static FeProfiler prof;
+    const char *want_profile = getenv("FERRITE_PROFILE");
+    int profile = want_profile && want_profile[0] == '1';
+    if (profile) {
+        fe_profiler_init(&prof);
+        for (int i = 0; i < g->n_nodes; i++) {
+            char *name = g->nodes[i].name, *cut = strrchr(name, '_');
+            if (cut) *cut = '\0';
+        }
+    }
+
     FeTensor *output = fe_tensor_alloc(DTYPE_FLOAT32, out_ndim, out_dims);
     double *times = malloc(sizeof(double) * (size_t)runs);
     for (int r = -1; r < runs; r++) {           /* r == -1 is the warm-up */
@@ -123,10 +141,12 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (r >= 0) times[r] = t;
+        if (r == -1 && profile) rt.profiler = &prof;   /* time the measured runs only */
     }
+    if (profile) fe_profiler_print(&prof);
     qsort(times, (size_t)runs, sizeof(double), cmp_double);
-    printf("nodes %d  load %.0f ms  best %.1f ms  median %.1f ms  (%d runs)\n",
-           g->n_nodes, t_load, times[0], times[runs / 2], runs);
+    printf("nodes %d  load %.0f ms  best %.1f ms  median %.1f ms  (%d runs, %d threads)\n",
+           g->n_nodes, t_load, times[0], times[runs / 2], runs, fe_get_num_threads());
 
     int rc = write_bin(argv[3], output);
     free(times);

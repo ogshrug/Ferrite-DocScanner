@@ -21,6 +21,9 @@ FeStatus fe_optimize(FeGraph *g, FeArena *weight_arena) {
     s = fe_pass_fuse_conv_bn(g, weight_arena);     /* Conv+BN -> Conv        */
     if (s != FE_OK) return s;
 
+    s = fe_pass_fuse_conv_relu(g);                 /* Conv+Relu -> Conv      */
+    if (s != FE_OK) return s;
+
     s = fe_pass_cse(g);                       /* common subexpressions      */
     if (s != FE_OK) return s;
 

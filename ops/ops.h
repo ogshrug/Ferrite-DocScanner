@@ -141,6 +141,24 @@ enum { FE_PAD_CONSTANT = 0, FE_PAD_REFLECT = 1, FE_PAD_EDGE = 2 };
 FeStatus fe_pad2d(const FeTensor *in, FeTensor *out, int top, int left,
                   int mode, float value);
 
+/* ---- Threads (ops/threads.c) ---- */
+
+/*
+ * Size of the worker pool that large kernels (GEMM, convolution) split their work
+ * across, counting the calling thread. 1 (the default) keeps everything on the
+ * calling thread. Results are identical for every thread count. Not to be called
+ * while an inference is running.
+ */
+void fe_set_num_threads(int n);
+int  fe_get_num_threads(void);
+
+/*
+ * Runs fn(ctx, i) for i in [0, n) on the pool and returns when all are done. The
+ * calls must be independent. Runs serially when the pool is off or already busy
+ * with another caller's work.
+ */
+void fe_parallel_for(int n, void (*fn)(void *ctx, int index), void *ctx);
+
 #endif // FERRITE_OPS_H
 
 /*
@@ -179,11 +197,12 @@ FeStatus fe_conv2d(const FeTensor *input, const FeTensor *weight,
  * H_out = (H + 2*pad_h - (dil_h*(KH-1) + 1)) / stride_h + 1, same for W.
  * Depthwise (groups == C_in) and 1x1 stride-1 convolutions take direct paths with no
  * scratch buffer; other shapes allocate and free an im2col buffer.
+ * relu != 0 applies max(0, x) to the result (Conv+Relu fused at load time).
  */
 FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
                       const FeTensor *bias, FeTensor *out,
                       int stride_h, int stride_w, int pad_h, int pad_w,
-                      int dil_h, int dil_w, int groups);
+                      int dil_h, int dil_w, int groups, int relu);
 
 /*
  * Max pooling over a 2D spatial map. Input [N, C, H, W] (or [C, H, W]),

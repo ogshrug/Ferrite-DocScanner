@@ -17,6 +17,11 @@
  */
 FeStatus fe_matmul_avx2(const FeTensor *A, const FeTensor *B, FeTensor *C);
 
+/* Raw-pointer form: overwrites the M x N block of C (row stride ldc) with A @ B
+ * (row strides lda, ldb). Used by the threaded path in fe_matmul. */
+void fe_gemm_avx2(const float *a, int lda, const float *b, int ldb,
+                  float *c, int ldc, int M, int N, int K);
+
 /* Runtime check: returns 1 if AVX2 is available. */
 int fe_cpu_has_avx2(void);
 
