@@ -109,7 +109,9 @@ endif()
 
 option(FERRITE_COVERAGE "Build with gcov coverage instrumentation" OFF)
 if(FERRITE_COVERAGE)
-    add_compile_options(--coverage)
+    # Atomic counters: tests run kernels on the thread pool, and plain gcov
+    # counters updated from several threads come out corrupted (negative).
+    add_compile_options(--coverage -fprofile-update=atomic)
     add_link_options(--coverage)
 endif()
 

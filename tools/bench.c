@@ -1,8 +1,16 @@
 #include "bench.h"
-#include "matmul_avx2.h"
 #include <stdio.h>
 #include <time.h>
+
+/* CPUID and the AVX2 kernels exist only on x86; on other targets (ARM) the
+ * header reports the NEON or scalar backend instead. */
+#if defined(__x86_64__) || defined(__i386__)
+#define FE_BENCH_X86 1
 #include <cpuid.h>
+#ifndef FERRITE_NO_AVX2
+#include "matmul_avx2.h"
+#endif
+#endif
 
 double fe_bench_ms(void) {
     struct timespec ts;
@@ -27,6 +35,7 @@ double fe_bench_gflops(double ms, double n_flops) {
  */
 void fe_bench_header(const char *name) {
     char brand[49] = {0};
+#ifdef FE_BENCH_X86
     unsigned int regs[4];
     if (__get_cpuid(0x80000000, &regs[0], &regs[1], &regs[2], &regs[3]) &&
         regs[0] >= 0x80000004) {
@@ -41,10 +50,19 @@ void fe_bench_header(const char *name) {
     } else {
         snprintf(brand, sizeof(brand), "unknown");
     }
+#else
+    snprintf(brand, sizeof(brand), "unknown (not x86)");
+#endif
 
     printf("=== %s ===\n", name);
     printf("CPU:   %s\n", brand);
+#if defined(FE_BENCH_X86) && !defined(FERRITE_NO_AVX2)
     printf("AVX2:  %s\n", fe_cpu_has_avx2() ? "yes" : "no");
+#elif defined(__aarch64__) && !defined(FERRITE_NO_NEON)
+    printf("SIMD:  NEON (AArch64)\n");
+#else
+    printf("SIMD:  scalar\n");
+#endif
 #ifdef __AVX2__
     printf("Build: compiled with -mavx2 (SIMD-kernel translations enabled)\n");
 #else
