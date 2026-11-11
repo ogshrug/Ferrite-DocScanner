@@ -130,6 +130,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    size_t need = 0;
+    if (fe_runtime_required_bytes(&rt, input, &need) == FE_OK)
+        fprintf(stderr, "activations: %.1f MB\n", need / 1048576.0);
+
     FeTensor *output = fe_tensor_alloc(DTYPE_FLOAT32, out_ndim, out_dims);
     double *times = malloc(sizeof(double) * (size_t)runs);
     for (int r = -1; r < runs; r++) {           /* r == -1 is the warm-up */

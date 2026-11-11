@@ -8,49 +8,51 @@
  * which adds a 6 x 16 block (A_blk: 6 rows of length kc, row stride lda; Bp: kc rows
  * of 16 packed floats) into C_blk (row stride ldc), then includes this file to get
  *
- *     static void gemm_blocked(const float *a, int lda, const float *b, int ldb,
- *                              float *c, int ldc, int M, int N, int K);
+ *     gemm_blocked_pack(a, lda, pack, ctx, c, ldc, M, N, K)
+ *         C[M x N] = A[M x K] @ B[K x N], where B is never read directly: pack(ctx, k0,
+ *         kc, n0, nr, Bp) writes the kc x nr block of B at (k0, n0) into Bp as kc rows of
+ *         16, zero-padding columns nr..15. A convolution passes a pack function that
+ *         reads its input image directly, so no im2col matrix is ever built.
+ *     gemm_blocked(a, lda, b, ldb, c, ldc, M, N, K)
+ *         the same with B an ordinary row-major matrix.
  *
- * which overwrites the M x N block of C with A @ B. A, B and C are row-major with
- * the given leading dimensions, so a caller can hand it a column range of a larger
- * matrix (that is how the threaded path splits the work).
- *
- * K is taken GEMM_KC at a time so a packed B panel stays in L1. B is packed per
- * 16-column strip and zero-padded at the right edge, so the kernel never branches on
- * N; A is read in place. Ragged edges (fewer than 6 rows or 16 columns left) run the
- * same kernel on small local copies. Every element of C is summed over k in the same
- * order whatever the block sizes, so splitting C by columns gives identical results.
+ * Blocking (GotoBLAS-style): N is taken GEMM_NC columns at a time, so that block of C
+ * stays in cache while K is walked GEMM_KC at a time; for each (n, k) block every
+ * 16-column panel of B is packed once and reused by all M rows. Each C element is
+ * summed over k in the same order whatever the block sizes, so splitting C by
+ * columns (the threaded path) gives identical results.
  */
 #ifndef GEMM_KERNEL
 #error "define GEMM_KERNEL before including gemm_driver.h"
 #endif
 
 #include <string.h>
+#include "backend.h"
 
 #define GEMM_MR 6
 #define GEMM_NR 16
 #define GEMM_KC 256
+#define GEMM_NC 128                         /* 8 panels: 128 KB of packed B */
 
-static void gemm_blocked(const float *a, int lda, const float *b, int ldb,
-                         float *c, int ldc, int M, int N, int K) {
+static void gemm_blocked_pack(const float *a, int lda, FeGemmPackB pack, const void *ctx,
+                              float *c, int ldc, int M, int N, int K) {
     for (int i = 0; i < M; i++) memset(c + (size_t)i * ldc, 0, (size_t)N * sizeof(float));
     if (M <= 0 || N <= 0 || K <= 0) return;
 
-    float Bp[GEMM_KC * GEMM_NR];            /* one packed B panel: 16 KB */
-    float A_edge[GEMM_MR * GEMM_KC];        /* the last few rows of A, zero-padded */
-    float C_edge[GEMM_MR * GEMM_NR];        /* a ragged block of C */
+    float Bp[GEMM_NC / GEMM_NR][GEMM_KC * GEMM_NR];
+    float A_edge[GEMM_MR * GEMM_KC];
+    float C_edge[GEMM_MR * GEMM_NR];
 
-    for (int k0 = 0; k0 < K; k0 += GEMM_KC) {
-        int kc = K - k0 < GEMM_KC ? K - k0 : GEMM_KC;
+    for (int nb = 0; nb < N; nb += GEMM_NC) {
+        int ncols = N - nb < GEMM_NC ? N - nb : GEMM_NC;
+        int panels = (ncols + GEMM_NR - 1) / GEMM_NR;
 
-        for (int n0 = 0; n0 < N; n0 += GEMM_NR) {
-            int nr = N - n0 < GEMM_NR ? N - n0 : GEMM_NR;
-
-            for (int k = 0; k < kc; k++) {
-                const float *src = b + (size_t)(k0 + k) * ldb + n0;
-                float *dst = Bp + k * GEMM_NR;
-                memcpy(dst, src, (size_t)nr * sizeof(float));
-                if (nr < GEMM_NR) memset(dst + nr, 0, (size_t)(GEMM_NR - nr) * sizeof(float));
+        for (int k0 = 0; k0 < K; k0 += GEMM_KC) {
+            int kc = K - k0 < GEMM_KC ? K - k0 : GEMM_KC;
+            for (int p = 0; p < panels; p++) {
+                int n0 = nb + p * GEMM_NR;
+                int nr = N - n0 < GEMM_NR ? N - n0 : GEMM_NR;
+                pack(ctx, k0, kc, n0, nr, Bp[p]);
             }
 
             for (int m0 = 0; m0 < M; m0 += GEMM_MR) {
@@ -65,21 +67,42 @@ static void gemm_blocked(const float *a, int lda, const float *b, int ldb,
                     A_blk = A_edge;
                     a_ld = GEMM_KC;
                 }
-
-                float *C_blk = c + (size_t)m0 * ldc + n0;
-                if (mr == GEMM_MR && nr == GEMM_NR) {
-                    GEMM_KERNEL(A_blk, a_ld, Bp, kc, C_blk, ldc);
-                } else {
-                    memset(C_edge, 0, sizeof(C_edge));
-                    for (int i = 0; i < mr; i++)
-                        memcpy(C_edge + i * GEMM_NR, C_blk + (size_t)i * ldc,
-                               (size_t)nr * sizeof(float));
-                    GEMM_KERNEL(A_blk, a_ld, Bp, kc, C_edge, GEMM_NR);
-                    for (int i = 0; i < mr; i++)
-                        memcpy(C_blk + (size_t)i * ldc, C_edge + i * GEMM_NR,
-                               (size_t)nr * sizeof(float));
+                for (int p = 0; p < panels; p++) {
+                    int n0 = nb + p * GEMM_NR;
+                    int nr = N - n0 < GEMM_NR ? N - n0 : GEMM_NR;
+                    float *C_blk = c + (size_t)m0 * ldc + n0;
+                    if (mr == GEMM_MR && nr == GEMM_NR) {
+                        GEMM_KERNEL(A_blk, a_ld, Bp[p], kc, C_blk, ldc);
+                    } else {
+                        memset(C_edge, 0, sizeof(C_edge));
+                        for (int i = 0; i < mr; i++)
+                            memcpy(C_edge + i * GEMM_NR, C_blk + (size_t)i * ldc,
+                                   (size_t)nr * sizeof(float));
+                        GEMM_KERNEL(A_blk, a_ld, Bp[p], kc, C_edge, GEMM_NR);
+                        for (int i = 0; i < mr; i++)
+                            memcpy(C_blk + (size_t)i * ldc, C_edge + i * GEMM_NR,
+                                   (size_t)nr * sizeof(float));
+                    }
                 }
             }
         }
     }
+}
+
+typedef struct { const float *b; int ldb; } GemmMatrixB;
+
+static void gemm_pack_matrix(const void *ctx, int k0, int kc, int n0, int nr, float *Bp) {
+    const GemmMatrixB *m = (const GemmMatrixB *)ctx;
+    for (int k = 0; k < kc; k++) {
+        const float *src = m->b + (size_t)(k0 + k) * m->ldb + n0;
+        float *dst = Bp + k * GEMM_NR;
+        memcpy(dst, src, (size_t)nr * sizeof(float));
+        if (nr < GEMM_NR) memset(dst + nr, 0, (size_t)(GEMM_NR - nr) * sizeof(float));
+    }
+}
+
+static void gemm_blocked(const float *a, int lda, const float *b, int ldb,
+                         float *c, int ldc, int M, int N, int K) {
+    GemmMatrixB m = { b, ldb };
+    gemm_blocked_pack(a, lda, gemm_pack_matrix, &m, c, ldc, M, N, K);
 }

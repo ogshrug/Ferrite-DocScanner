@@ -25,6 +25,7 @@ static void mul_scalar(const float *a, const float *b, float *out, int n) {
 static const FeSimdOps k_scalar_ops = {
     .matmul = NULL,          /* resolved to fe_matmul_scalar by the caller */
     .gemm   = NULL,
+    .gemm_packed = NULL,
     .relu   = relu_scalar,
     .add    = add_scalar,
     .mul    = mul_scalar,

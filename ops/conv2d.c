@@ -1,17 +1,20 @@
 /* ops/conv2d.c — 2D convolution (Stage 3, CNN family).
  *
- * Three paths, picked per call, each split across the thread pool (ops/threads.c):
+ * Paths, picked per call, each split across the thread pool (ops/threads.c):
  *   - depthwise (groups == C_in, one input channel per filter): direct accumulation,
  *     one kernel tap at a time, with no scratch buffer;
  *   - 1x1, stride 1, no padding: the input already is the im2col matrix, so it goes
  *     straight to GEMM;
- *   - everything else: im2col -> GEMM, one group at a time.
+ *   - everything else, with a vector backend: implicit GEMM, which packs
+ *     the im2col panels straight from the input and never stores them;
+ *   - everything else on a scalar build: im2col -> GEMM, one group at a time.
  *
  * The one exception to the "no allocation inside kernels" rule, mirroring
  * fe_conv1d: the im2col scratch buffer is malloc'd here and freed before
  * returning. Everything else follows the kernel contract.
  */
 #include "ops.h"
+#include "backend.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -131,6 +134,93 @@ static void depthwise_channel(void *p, int c) {
     }
 }
 
+/* ---- Implicit GEMM: the vector path for every conv that isn't depthwise or 1x1 ----
+ *
+ * out[oc, p] = sum_k W[oc, k] * B[k, p] with B[(c, i, j), (oh, ow)] =
+ * in[c, oh*sh + i*dh - ph, ow*sw + j*dw - pw] (0 outside the image). B is the im2col
+ * matrix, but it is never stored: the GEMM driver asks for one 16-column panel at a
+ * time and conv_pack reads it straight from the input. For UVDoc's dilated 5x5 layers
+ * the stored matrix would be close to 300 MB.
+ */
+typedef struct {
+    const float *src;            /* the group's first input channel */
+    int H, W, KH, KW, OW, sh, sw, ph, pw, dh, dw;
+    int col0;                    /* output pixel of the task's column 0 */
+} ConvPack;
+
+static void conv_pack(const void *p, int k0, int kc, int n0, int nr, float *Bp) {
+    const ConvPack *q = (const ConvPack *)p;
+    int H = q->H, W = q->W, KHW = q->KH * q->KW, KW = q->KW;
+    int oy[16], ox[16];
+    for (int t = 0; t < nr; t++) {
+        int pix = q->col0 + n0 + t;
+        oy[t] = pix / q->OW;
+        ox[t] = pix - oy[t] * q->OW;
+    }
+    int one_row = oy[0] == oy[nr - 1];
+    for (int k = 0; k < kc; k++) {
+        int kk = k0 + k, c = kk / KHW, r = kk - c * KHW, i = r / KW, j = r - (r / KW) * KW;
+        const float *chan = q->src + (size_t)c * H * W;
+        float *d = Bp + k * 16;
+        int dy = i * q->dh - q->ph, dx = j * q->dw - q->pw;
+        if (one_row) {
+            int y = oy[0] * q->sh + dy;
+            int x0 = ox[0] * q->sw + dx;
+            if (y < 0 || y >= H) {
+                memset(d, 0, 16 * sizeof(float));
+                continue;
+            }
+            const float *row = chan + (size_t)y * W;
+            if (q->sw == 1 && x0 >= 0 && x0 + nr <= W) {
+                memcpy(d, row + x0, (size_t)nr * sizeof(float));
+            } else {
+                for (int t = 0; t < nr; t++) {
+                    int x = x0 + t * q->sw;
+                    d[t] = (x >= 0 && x < W) ? row[x] : 0.0f;
+                }
+            }
+        } else {
+            for (int t = 0; t < nr; t++) {
+                int y = oy[t] * q->sh + dy, x = ox[t] * q->sw + dx;
+                d[t] = (y >= 0 && y < H && x >= 0 && x < W) ? chan[(size_t)y * W + x] : 0.0f;
+            }
+        }
+        for (int t = nr; t < 16; t++) d[t] = 0.0f;
+    }
+}
+
+typedef struct {
+    const FeSimdOps *ops;
+    const float *w, *bias;       /* the group's weights [Og x K] and biases */
+    float *out;                  /* the group's output [Og x plane] */
+    ConvPack pack;
+    int Og, K, plane, cols_per_task, relu;
+} ConvTask;
+
+static void conv_task(void *p, int t) {
+    const ConvTask *q = (const ConvTask *)p;
+    int c0 = t * q->cols_per_task;
+    int n = q->plane - c0 < q->cols_per_task ? q->plane - c0 : q->cols_per_task;
+    if (n <= 0) return;
+    ConvPack pk = q->pack;
+    pk.col0 = c0;
+    float *o = q->out + c0;
+    q->ops->gemm_packed(q->w, q->K, conv_pack, &pk, o, q->plane, q->Og, n, q->K);
+    if (q->bias || q->relu) {
+        for (int oc = 0; oc < q->Og; oc++) {
+            float b = q->bias ? q->bias[oc] : 0.0f;
+            float *row = o + (size_t)oc * q->plane;
+            if (q->relu)
+                for (int px = 0; px < n; px++) {
+                    float v = row[px] + b;
+                    row[px] = v > 0.0f ? v : 0.0f;
+                }
+            else
+                for (int px = 0; px < n; px++) row[px] += b;
+        }
+    }
+}
+
 FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
                       const FeTensor *bias, FeTensor *out,
                       int sh, int sw, int ph, int pw,
@@ -182,6 +272,27 @@ FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
     int K = Cg * KH * KW;                /* rows of the im2col matrix */
     int pointwise = KH == 1 && KW == 1 && sh == 1 && sw == 1 && ph == 0 && pw == 0;
 
+    const FeSimdOps *ops = fe_simd_ops();
+    if (!pointwise && ops->gemm_packed) {
+        int threads = fe_get_num_threads();
+        int tasks = threads > 1 ? threads * 4 : 1;
+        int per = ((int)out_plane + tasks - 1) / tasks;
+        per = (per + 15) / 16 * 16;
+        if (per < 64) per = 64;
+        for (int n = 0; n < N; n++)
+            for (int g = 0; g < groups; g++) {
+                ConvTask q = {
+                    ops, w_data + (size_t)g * Og * K, b_data ? b_data + (size_t)g * Og : NULL,
+                    out_data + ((size_t)n * C_out + (size_t)g * Og) * out_plane,
+                    { in_data + ((size_t)n * C_in + (size_t)g * Cg) * in_plane,
+                      H, W, KH, KW, OW, sh, sw, ph, pw, dh, dw, 0 },
+                    Og, K, (int)out_plane, per, relu };
+                fe_parallel_for(((int)out_plane + per - 1) / per, conv_task, &q);
+            }
+        return FE_OK;
+    }
+
+    /* Scalar builds: im2col into a scratch matrix, then GEMM. */
     float *col = NULL;
     if (!pointwise) {
         col = malloc((size_t)K * out_plane * sizeof(float));

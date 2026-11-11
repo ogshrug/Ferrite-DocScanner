@@ -4,6 +4,7 @@
 
 #include "types.h"
 #include "tensor.h"
+#include "backend.h"
 
 /*
  * AArch64 NEON kernels (simd/matmul_neon.c). Compiled to nothing on other targets;
@@ -16,6 +17,8 @@
  */
 void     fe_gemm_neon(const float *a, int lda, const float *b, int ldb,
                       float *c, int ldc, int M, int N, int K);
+void fe_gemm_packed_neon(const float *a, int lda, FeGemmPackB pack, const void *ctx,
+                          float *c, int ldc, int M, int N, int K);
 FeStatus fe_matmul_neon(const FeTensor *A, const FeTensor *B, FeTensor *C);
 void     fe_relu_neon(const float *in, float *out, int n);
 void     fe_add_neon (const float *a, const float *b, float *out, int n);

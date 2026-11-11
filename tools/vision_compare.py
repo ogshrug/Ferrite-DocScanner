@@ -7,7 +7,7 @@ The input is a synthetic photo-like image (a bright page on a dark, textured
 background) at the model's own input size, in 0..1. For each model it prints
 Ferrite's and ONNX Runtime's single-threaded time and the largest absolute and
 relative differences in the output, and fails if they disagree by more than
---atol. Run tools/prepare_model.py on a model first.
+--atol. --reference points ONNX Runtime at a different copy of each model. Run tools/prepare_model.py on a model first.
 
 Needs: numpy, onnx, onnxruntime.
 """
@@ -57,6 +57,9 @@ def main() -> int:
     ap.add_argument("--atol", type=float, default=2e-3)
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--threads", type=int, default=1, help="threads for both runtimes")
+    ap.add_argument("--reference", help="directory of the models ONNX Runtime should run instead, "
+                    "matched by file name (for files made with prepare_model.py --fp16-weights, "
+                    "which only Ferrite can load)")
     ap.add_argument("models", nargs="+")
     args = ap.parse_args()
 
@@ -64,7 +67,8 @@ def main() -> int:
     for model in args.models:
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = args.threads
-        sess = ort.InferenceSession(model, opts, providers=["CPUExecutionProvider"])
+        ref_model = str(Path(args.reference) / Path(model).name) if args.reference else model
+        sess = ort.InferenceSession(ref_model, opts, providers=["CPUExecutionProvider"])
         shape = [d if isinstance(d, int) and d > 0 else 1 for d in sess.get_inputs()[0].shape]
         x = photo(shape)
         name = sess.get_inputs()[0].name

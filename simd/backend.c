@@ -26,6 +26,7 @@
 static const FeSimdOps k_neon_ops = {
     .matmul = fe_matmul_neon,
     .gemm   = fe_gemm_neon,
+    .gemm_packed = fe_gemm_packed_neon,
     .relu   = fe_relu_neon,
     .add    = fe_add_neon,
     .mul    = fe_mul_neon,
@@ -36,6 +37,7 @@ static const FeSimdOps k_neon_ops = {
 static const FeSimdOps k_avx2_ops = {
     .matmul = fe_matmul_avx2,
     .gemm   = fe_gemm_avx2,
+    .gemm_packed = fe_gemm_packed_avx2,
     .relu   = fe_relu_avx2,
     .add    = fe_add_avx2,
     .mul    = fe_mul_avx2,

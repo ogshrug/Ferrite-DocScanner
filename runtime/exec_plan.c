@@ -198,3 +198,23 @@ FeStatus fe_exec_run(FeExecPlan *ep, FeRuntime *rt,
 
     return copy_output(rt, output);
 }
+
+FeStatus fe_exec_required_bytes(FeExecPlan *ep, FeRuntime *rt,
+                                const FeTensor *input, size_t *bytes) {
+    if (!ep || !rt || !input || !bytes) return FE_ERR_NULL;
+    FeGraph *g = rt->graph;
+    int in_tidx = find_graph_input(g);
+    if (in_tidx < 0) return FE_ERR_SHAPE;
+    int save_ndim;
+    int save_shape[FERRITE_MAX_DIMS];
+    reset_produced_shapes(g, in_tidx, &save_ndim, save_shape);
+    int dynamic = 0;
+    FeStatus s = infer_shapes(rt, input, ep->input_dynamic, &dynamic);
+    if (s != FE_OK) return s;
+    ep->input_dynamic |= dynamic;
+    s = fe_plan_memory(g, &ep->plan);
+    if (s != FE_OK) return s;
+    *bytes = ep->plan.total_activation_bytes;
+    ep->plan_valid = 0;          /* fe_exec_run re-plans against its own buffer */
+    return FE_OK;
+}

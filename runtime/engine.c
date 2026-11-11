@@ -59,6 +59,12 @@ FeStatus fe_runtime_run(FeRuntime *rt,
     return fe_exec_run(&rt->exec, rt, input, output);
 }
 
+FeStatus fe_runtime_required_bytes(FeRuntime *rt, const FeTensor *input,
+                                   size_t *bytes) {
+    if (!rt) return FE_ERR_NULL;
+    return fe_exec_required_bytes(&rt->exec, rt, input, bytes);
+}
+
 FeStatus fe_runtime_run_batch(FeRuntime *rt,
                               FeTensor *const *inputs,
                               FeTensor *const *outputs,

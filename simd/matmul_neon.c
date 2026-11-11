@@ -54,6 +54,11 @@ void fe_gemm_neon(const float *a, int lda, const float *b, int ldb,
     gemm_blocked(a, lda, b, ldb, c, ldc, M, N, K);
 }
 
+void fe_gemm_packed_neon(const float *a, int lda, FeGemmPackB pack, const void *ctx,
+                         float *c, int ldc, int M, int N, int K) {
+    gemm_blocked_pack(a, lda, pack, ctx, c, ldc, M, N, K);
+}
+
 FeStatus fe_matmul_neon(const FeTensor *A, const FeTensor *B, FeTensor *C) {
     if (!A || !B || !C) return FE_ERR_NULL;
     if (A->ndim != 2 || B->ndim != 2 || C->ndim != 2) return FE_ERR_SHAPE;

@@ -64,4 +64,9 @@ FeStatus fe_exec_build(FeExecPlan *ep, FeRuntime *rt);
 FeStatus fe_exec_run(FeExecPlan *ep, FeRuntime *rt,
                      const FeTensor *input, FeTensor *output);
 
+/* Plans memory for an input of this shape without running, and reports the
+ * activation buffer size fe_exec_run will need in *bytes. */
+FeStatus fe_exec_required_bytes(FeExecPlan *ep, FeRuntime *rt,
+                                const FeTensor *input, size_t *bytes);
+
 #endif /* FERRITE_EXEC_PLAN_H */

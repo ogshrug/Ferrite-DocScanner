@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rewrites an ONNX model into the subset Ferrite loads, without changing what it computes.
 
-    python tools/prepare_model.py in.onnx out.onnx
+    python tools/prepare_model.py in.onnx out.onnx [--fp16-weights]
 
 Steps:
   1. ONNX Runtime's basic graph optimisation folds constants (Cast, Constant, Shape
@@ -12,6 +12,11 @@ Steps:
      raw float32 / int64, and value_info is dropped.
 
 The result is checked against the original on random input before it is written.
+
+--fp16-weights then stores as float16 every weight that float16 holds exactly (Ferrite
+widens them to float32 when it loads the model), so the file shrinks and nothing about
+the result changes. ONNX Runtime cannot run such a
+file, since the weights no longer match their operators' types; it is for Ferrite only.
 Needs: onnx, onnxruntime, numpy. None of this touches the runtime.
 """
 import os
@@ -149,8 +154,29 @@ def check(src: str, model: onnx.ModelProto) -> float:
     return float(np.abs(ya - yb).max())
 
 
+def store_half(model: onnx.ModelProto) -> int:
+    count = 0
+    fresh = []
+    for init in model.graph.initializer:
+        arr = numpy_helper.to_array(init)
+        if arr.dtype == np.float32 and arr.size >= 16:
+            half = arr.astype(np.float16)
+            # Only where nothing is lost: weights that came from a float16 model
+            # round-trip exactly, while ones the optimiser rewrote (a BatchNorm
+            # folded into a Conv) usually don't, and stay float32.
+            if np.array_equal(half.astype(np.float32), arr):
+                arr = half
+                count += 1
+        fresh.append(numpy_helper.from_array(arr, init.name))
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(fresh)
+    return count
+
+
 def main() -> None:
-    src, dst = sys.argv[1], sys.argv[2]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    half = "--fp16-weights" in sys.argv
+    src, dst = args[0], args[1]
     model = optimise(src)
     sums = rewrite_weighted_sums(model.graph)
     tidy(model)
@@ -158,10 +184,12 @@ def main() -> None:
     diff = check(src, model)
     if diff > 1e-4:
         sys.exit(f"prepared model disagrees with the original by {diff}")
+    halved = store_half(model) if half else 0
     onnx.save(model, dst)
     ops = sorted({n.op_type for n in model.graph.node})
     print(f"{dst}: {len(model.graph.node)} nodes, {sums} weighted sums rewritten, "
-          f"max difference from original {diff:.2e}")
+          f"max difference from original {diff:.2e}"
+          + (f", {halved} weights stored as float16" if half else ""))
     print("operators:", ", ".join(ops))
 
 

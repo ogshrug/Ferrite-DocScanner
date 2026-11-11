@@ -35,6 +35,12 @@ FeStatus fe_runtime_run(FeRuntime *rt,
                          const FeTensor *input,
                          FeTensor *output);
 
+/* The activation buffer size a run on an input shaped like `input` needs, so a
+ * caller can size it exactly (call fe_runtime_init again with a buffer that big).
+ * Only the input's shape is read. */
+FeStatus fe_runtime_required_bytes(FeRuntime *rt, const FeTensor *input,
+                                   size_t *bytes);
+
 /* Runs `n` inferences of the current graph on `inputs`/`outputs` (one
  * sample per entry; all samples share the caller's graph input shape).
  * Each call is fe_runtime_run, so after the first sample the static plan is

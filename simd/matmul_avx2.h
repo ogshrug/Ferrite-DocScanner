@@ -4,6 +4,7 @@
 
 #include "types.h"
 #include "tensor.h"
+#include "backend.h"
 
 /*
  * AVX2 tiled matrix multiplication: C = A @ B
@@ -21,6 +22,8 @@ FeStatus fe_matmul_avx2(const FeTensor *A, const FeTensor *B, FeTensor *C);
  * (row strides lda, ldb). Used by the threaded path in fe_matmul. */
 void fe_gemm_avx2(const float *a, int lda, const float *b, int ldb,
                   float *c, int ldc, int M, int N, int K);
+void fe_gemm_packed_avx2(const float *a, int lda, FeGemmPackB pack, const void *ctx,
+                          float *c, int ldc, int M, int N, int K);
 
 /* Runtime check: returns 1 if AVX2 is available. */
 int fe_cpu_has_avx2(void);

@@ -1,5 +1,6 @@
 // importer/onnx.c
 #include "ops.h"
+#include "fp16.h"
 #include "onnx.h"
 #include "tensor.h"
 #include "optim.h"
@@ -193,7 +194,7 @@ static int find_or_add_tensor(FeGraph *g, const char *name) {
  *   8 = name      (string)
  *   9 = raw_data  (bytes — values packed little-endian)
  *
- * FLOAT (1) loads as is. INT32 (6) and INT64 (7) tensors, which ONNX uses for
+ * FLOAT (1) loads as is, and FLOAT16 (10, raw_data only) is widened to float32. INT32 (6) and INT64 (7) tensors, which ONNX uses for
  * shapes, pads and axes, are converted to float32 so that the rest of the
  * runtime has one weight type; they are small integers, which float32 holds
  * exactly. A scalar (no dims) loads as a one-element vector.
@@ -313,9 +314,10 @@ static FeStatus parse_initializer(FePbReader *r, FeGraph *g,
         ndim = 1;
     }
 
-    if (data_type != 0 && data_type != 1 && data_type != 6 && data_type != 7) {
+    if (data_type != 0 && data_type != 1 && data_type != 6 && data_type != 7 &&
+        !(data_type == 10 && raw_data)) {
         fprintf(stderr, "ONNX: initializer '%s' has unsupported data type %d "
-                "(float32, int32 and int64 load)\n",
+                "(float32, raw float16, int32 and int64 load)\n",
                 name[0] ? name : "(unnamed)", data_type);
         free(fvals);
         return FE_ERR_DTYPE;
@@ -358,7 +360,15 @@ static FeStatus parse_initializer(FePbReader *r, FeGraph *g,
                                        DTYPE_FLOAT32, ndim, dims);
     if (!e->tensor) { free(fvals); return FE_ERR_NOMEM; }
 
-    if (raw_data && data_type == 7) {
+    if (raw_data && data_type == 10) {
+        /* Half-precision storage, widened once here: every kernel works in float32. */
+        if (raw_len != (size_t)(numel * 2)) { free(fvals); return FE_ERR_SHAPE; }
+        float *dst = (float *)e->tensor->data;
+        for (int64_t k = 0; k < numel; k++) {
+            uint16_t h = (uint16_t)(raw_data[k * 2] | (raw_data[k * 2 + 1] << 8));
+            dst[k] = fe_fp16_to_f32(h);
+        }
+    } else if (raw_data && data_type == 7) {
         if (raw_len != (size_t)(numel * 8)) { free(fvals); return FE_ERR_SHAPE; }
         float *dst = (float *)e->tensor->data;
         for (int64_t k = 0; k < numel; k++) {
@@ -1220,6 +1230,20 @@ FeStatus fe_onnx_load(FeGraph *graph, FeArena *weight_arena,
     }
     fclose(f);
 
+    FeStatus status = fe_onnx_load_buffer(graph, weight_arena, buf, (size_t)fsize);
+    free(buf);
+    if (status == FE_OK)
+        fe_log_info("loaded %d nodes, %d tensors from %s",
+                    graph->n_nodes, graph->n_tensors, path);
+    return status;
+}
+
+FeStatus fe_onnx_load_buffer(FeGraph *graph, FeArena *weight_arena,
+                             const void *data, size_t len) {
+    if (!graph || !weight_arena || !data) return FE_ERR_NULL;
+    const unsigned char *buf = (const unsigned char *)data;
+    size_t fsize = len;
+
     fe_graph_init(graph);
 
     /*
@@ -1227,7 +1251,7 @@ FeStatus fe_onnx_load(FeGraph *graph, FeArena *weight_arena,
      *   7 = graph (GraphProto)
      */
     FePbReader r;
-    fe_pb_init(&r, buf, (size_t)fsize);
+    fe_pb_init(&r, buf, fsize);
 
     FeStatus status = FE_OK;
     while (!fe_pb_done(&r)) {
@@ -1250,8 +1274,6 @@ FeStatus fe_onnx_load(FeGraph *graph, FeArena *weight_arena,
         }
     }
 
-    free(buf);
-
     if (status == FE_OK)
         status = resolve_constant_inputs(graph);
     if (status == FE_OK)
@@ -1269,9 +1291,5 @@ FeStatus fe_onnx_load(FeGraph *graph, FeArena *weight_arena,
      * policy: INFO compiles out at the default WARN level, so release builds
      * stay silent. Callers wanting the node dump call fe_graph_print.
      */
-    if (status == FE_OK)
-        fe_log_info("loaded %d nodes, %d tensors from %s",
-                    graph->n_nodes, graph->n_tensors, path);
-
     return status;
 }

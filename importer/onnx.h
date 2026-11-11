@@ -24,6 +24,13 @@ FeStatus fe_onnx_load(FeGraph *graph, FeArena *weight_arena,
                        const char *path);
 
 /*
+ * The same, from a model already in memory (an Android asset, an embedded array).
+ * Weights are copied into weight_arena, so data may be freed once this returns.
+ */
+FeStatus fe_onnx_load_buffer(FeGraph *graph, FeArena *weight_arena,
+                             const void *data, size_t len);
+
+/*
  * Internal protobuf reader — exposed for testing.
  *
  * A cursor into a byte buffer. All parse functions advance
