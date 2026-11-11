@@ -209,7 +209,11 @@ jobs:
       - name: Install cross toolchain + qemu
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build qemu-user-static
+          # Ubuntu 26 runners no longer have a qemu-user-static package; fall back
+          # to qemu-user and give its qemu-arm the name the toolchain file uses.
+          sudo apt-get install -y ninja-build qemu-user-static || sudo apt-get install -y ninja-build qemu-user
+          command -v qemu-arm-static >/dev/null || sudo ln -sf "$(command -v qemu-arm)" /usr/local/bin/qemu-arm-static
+          qemu-arm-static --version | head -1
           # armhf cross gcc: metapackage in noble main, but the runner's mirror
           # occasionally flubs it — fall back to the versioned handle which is
           # always in universe.

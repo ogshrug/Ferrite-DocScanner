@@ -39,6 +39,7 @@ idf_component_register(
         "${FERRITE_ROOT}/ops/norm.c"
         "${FERRITE_ROOT}/ops/pool.c"
         "${FERRITE_ROOT}/ops/sequence.c"
+        "${FERRITE_ROOT}/ops/vision.c"
         "${FERRITE_ROOT}/simd/backend.c"
         "${FERRITE_ROOT}/simd/scalar.c"
         "${FERRITE_ROOT}/planner/memory_planner.c"
