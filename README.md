@@ -322,9 +322,16 @@ Ryzen 5 5600, both runtimes given the same number of threads:
 | DocAligner LCNet-100, 256x256 | 5.5e-6 | 63 ms | 26 ms | 23 ms | 7 ms |
 | UVDoc, 712x488 | 1.9e-6 | 642 ms | 326 ms | 262 ms | 94 ms |
 
+On GitHub's arm64 runner (NEON), from the `scanner models vs ONNX Runtime (arm64)` CI job:
+
+| Model | Max difference | Ferrite, 1 thread | ONNX Runtime, 1 thread | Ferrite, 4 threads | ONNX Runtime, 4 threads |
+|---|---|---|---|---|---|
+| DocAligner LCNet-100 | 4.6e-6 | 92 ms | 50 ms | 36 ms | 16 ms |
+| UVDoc | 1.8e-6 | 1194 ms | 819 ms | 385 ms | 209 ms |
+
 At the start of this work Ferrite could not load either model, and with the first
 operators in place it took 90 ms and 1464 ms single-threaded. It is still 2 to 3 times
-slower than ONNX Runtime. CI runs the same comparison on x86-64 and on a native arm64
+slower than ONNX Runtime on x86, and 1.5 to 2 times on arm64. CI runs the same comparison on x86-64 and on a native arm64
 runner (NEON), and the full test suite on arm64 under ASan/UBSan.
 
 `tests/test_vision.c` checks every new kernel against a direct reference, the vector
