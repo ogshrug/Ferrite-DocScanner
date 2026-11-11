@@ -290,6 +290,15 @@ it, so results are bit-identical at every thread count (`test_threads_are_bit_id
 Two callers on different threads don't share the pool; the second simply runs serially.
 Builds without threads (`FERRITE_NO_PARALLEL`, as on ESP32) get a plain loop.
 
+**Convolution without im2col**
+
+On a vector backend a convolution never builds its im2col matrix. The GEMM driver asks a
+packing callback for one 16-column panel of B at a time, and the convolution fills it
+straight from the input image (`conv_pack` in `ops/conv2d.c`); the driver blocks N in
+128-column chunks so each block of the output stays in cache while K is walked. For
+UVDoc's dilated 5x5 layers the stored matrix would have been close to 300 MB. Scalar
+builds keep the im2col path.
+
 **Other speed-ups**
 
 - Conv followed by Relu is fused at load time into a conv that clamps as it writes
@@ -319,20 +328,30 @@ Ryzen 5 5600, both runtimes given the same number of threads:
 
 | Model | Max difference from ONNX Runtime | Ferrite, 1 thread | ONNX Runtime 1.30, 1 thread | Ferrite, 6 threads | ONNX Runtime, 6 threads |
 |---|---|---|---|---|---|
-| DocAligner LCNet-100, 256x256 | 5.5e-6 | 63 ms | 26 ms | 23 ms | 7 ms |
-| UVDoc, 712x488 | 1.9e-6 | 642 ms | 326 ms | 262 ms | 94 ms |
+| DocAligner LCNet-100, 256x256 | 5.5e-6 | 51 ms | 26 ms | 17 ms | 7 ms |
+| UVDoc, 712x488 | 1.9e-6 | 505 ms | 326 ms | 117 ms | 94 ms |
 
 On GitHub's arm64 runner (NEON), from the `scanner models vs ONNX Runtime (arm64)` CI job:
 
 | Model | Max difference | Ferrite, 1 thread | ONNX Runtime, 1 thread | Ferrite, 4 threads | ONNX Runtime, 4 threads |
 |---|---|---|---|---|---|
-| DocAligner LCNet-100 | 4.6e-6 | 92 ms | 50 ms | 36 ms | 16 ms |
-| UVDoc | 1.8e-6 | 1194 ms | 819 ms | 385 ms | 209 ms |
+| DocAligner LCNet-100 | 4.6e-6 | 78 ms | 50 ms | 29 ms | 16 ms |
+| UVDoc | 1.8e-6 | 1052 ms | 843 ms | 284 ms | 211 ms |
 
 At the start of this work Ferrite could not load either model, and with the first
-operators in place it took 90 ms and 1464 ms single-threaded. It is still 2 to 3 times
-slower than ONNX Runtime on x86, and 1.5 to 2 times on arm64. CI runs the same comparison on x86-64 and on a native arm64
+operators in place it took 90 ms and 1464 ms single-threaded. It is still 1.3 to 2 times
+slower than ONNX Runtime single-threaded, and 1.2 to 2.4 times with threads. CI runs the same comparison on x86-64 and on a native arm64
 runner (NEON), and the full test suite on arm64 under ASan/UBSan.
+
+**In the app**
+
+FlatDocScanner's `ferrite` build runs both models on this runtime (it is a submodule there,
+built with the NDK; see `app/src/ferrite/cpp`). Two additions serve it:
+`fe_onnx_load_buffer` loads a model already in memory (an APK asset), and
+`fe_runtime_required_bytes` reports the activation buffer an input needs, so the app
+allocates exactly that (DocAligner 28 MB, UVDoc 23 MB). `prepare_model.py --fp16-weights`
+stores every weight that float16 holds exactly as float16, which the importer widens on
+load: the app's model files stay at 2.4 MB and 15.8 MB with no change to the results.
 
 `tests/test_vision.c` checks every new kernel against a direct reference, the vector
 GEMM against the scalar one at ragged sizes, fused Conv+Relu against Conv then Relu, and
