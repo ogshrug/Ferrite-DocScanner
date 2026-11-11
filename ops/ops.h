@@ -79,6 +79,68 @@ FeStatus fe_softmax(const FeTensor *in, FeTensor *out);
  */
 FeStatus fe_bias_add(const FeTensor *in, const FeTensor *bias, FeTensor *out);
 
+/* ---- Vision (ops/vision.c, ops/pool.c, ops/elementwise.c) ---- */
+
+/*
+ * Pooling with symmetric zero padding. OH = (H + 2*pad_h - KH)/stride_h + 1.
+ * Padding never wins a max, and an average divides by the number of real
+ * samples under the window (ONNX count_include_pad = 0).
+ */
+FeStatus fe_maxpool_pad(const FeTensor *in, FeTensor *out, int kh, int kw,
+                        int stride_h, int stride_w, int pad_h, int pad_w);
+FeStatus fe_avgpool_pad(const FeTensor *in, FeTensor *out, int kh, int kw,
+                        int stride_h, int stride_w, int pad_h, int pad_w);
+
+/*
+ * Elementwise a (op) b with NumPy broadcasting: shapes are aligned at their last
+ * dimension and a dimension of 1 stretches. `out` must already have the broadcast
+ * shape. op: 0 add, 1 sub, 2 mul, 3 div.
+ */
+FeStatus fe_broadcast_binary(const FeTensor *a, const FeTensor *b,
+                             FeTensor *out, int op);
+
+/*
+ * Joins n tensors along `axis` (negative counts from the end). Every other
+ * dimension must match, and out->shape[axis] must be the sum of the inputs'.
+ */
+FeStatus fe_concat(const FeTensor *const *ins, int n, int axis, FeTensor *out);
+
+/* How Resize maps an output pixel back to the input (ONNX
+ * coordinate_transformation_mode). */
+enum { FE_RESIZE_HALF_PIXEL = 0, FE_RESIZE_ALIGN_CORNERS = 1, FE_RESIZE_ASYMMETRIC = 2 };
+enum { FE_RESIZE_NEAREST = 0, FE_RESIZE_LINEAR = 1 };
+
+/*
+ * Bilinear resize of [N, C, H, W] to out's spatial size. Source coordinates are
+ * clamped to the image, as ONNX "linear" does.
+ */
+FeStatus fe_resize_bilinear(const FeTensor *in, FeTensor *out, int coord_mode);
+
+/* Nearest-neighbour resize: source index = floor(o * in / out) (asymmetric, floor). */
+FeStatus fe_resize_nearest(const FeTensor *in, FeTensor *out);
+
+/* out = min(max(in, lo), hi). Supports in-place. */
+FeStatus fe_clip(const FeTensor *in, FeTensor *out, float lo, float hi);
+
+/* Mean over H and W of [N, C, H, W]; out is [N, C, 1, 1]. */
+FeStatus fe_global_avgpool(const FeTensor *in, FeTensor *out);
+
+/*
+ * out = in >= 0 ? in : slope * in. `slope` holds one value, or one per channel
+ * of an [N, C, ...] input. Supports in-place.
+ */
+FeStatus fe_prelu(const FeTensor *in, const FeTensor *slope, FeTensor *out);
+
+enum { FE_PAD_CONSTANT = 0, FE_PAD_REFLECT = 1, FE_PAD_EDGE = 2 };
+
+/*
+ * Pads H and W of [N, C, H, W]. The input lands at (top, left) inside out, whose
+ * size fixes the bottom and right padding. Constant mode fills with `value`;
+ * reflect mirrors without repeating the edge sample; edge repeats it.
+ */
+FeStatus fe_pad2d(const FeTensor *in, FeTensor *out, int top, int left,
+                  int mode, float value);
+
 #endif // FERRITE_OPS_H
 
 /*
@@ -109,6 +171,19 @@ FeStatus fe_conv1d(const FeTensor *input, const FeTensor *weight,
 FeStatus fe_conv2d(const FeTensor *input, const FeTensor *weight,
                    const FeTensor *bias, FeTensor *out,
                    int stride_h, int stride_w, int pad_h, int pad_w);
+
+/*
+ * 2D convolution with dilation and groups.
+ *
+ * weight: [C_out, C_in / groups, KH, KW]; C_in and C_out must both divide by groups.
+ * H_out = (H + 2*pad_h - (dil_h*(KH-1) + 1)) / stride_h + 1, same for W.
+ * Depthwise (groups == C_in) and 1x1 stride-1 convolutions take direct paths with no
+ * scratch buffer; other shapes allocate and free an im2col buffer.
+ */
+FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
+                      const FeTensor *bias, FeTensor *out,
+                      int stride_h, int stride_w, int pad_h, int pad_w,
+                      int dil_h, int dil_w, int groups);
 
 /*
  * Max pooling over a 2D spatial map. Input [N, C, H, W] (or [C, H, W]),

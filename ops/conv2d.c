@@ -1,4 +1,11 @@
-/* ops/conv2d.c — 2D convolution via im2col -> GEMM (Stage 3, CNN family).
+/* ops/conv2d.c — 2D convolution (Stage 3, CNN family).
+ *
+ * Three paths, picked per call:
+ *   - depthwise (groups == C_in, one input channel per filter): direct accumulation,
+ *     one kernel tap at a time, with no scratch buffer;
+ *   - 1x1, stride 1, no padding: the input already is the im2col matrix, so it goes
+ *     straight to GEMM;
+ *   - everything else: im2col -> GEMM, one group at a time.
  *
  * The one exception to the "no allocation inside kernels" rule, mirroring
  * fe_conv1d: the im2col scratch buffer is malloc'd here and freed before
@@ -8,39 +15,105 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Build the im2col matrix for one batch element:
- *   col: [C_in*KH*KW, OH*OW], col[i, j] = input[n, c, oh*sh+i-pad_h, ow*sw+j-pad_w]
+/* First and one-past-last output index whose input coordinate o*stride + off lies in
+ * [0, n). Empty when *lo >= *hi. */
+static void valid_range(int out_n, int stride, int off, int n, int *lo, int *hi) {
+    int a = 0;
+    if (off < 0) a = (-off + stride - 1) / stride;
+    int b = out_n;
+    if (off >= n) b = 0;
+    else {
+        int last = (n - 1 - off) / stride;      /* largest o with o*stride+off <= n-1 */
+        if (last + 1 < b) b = last + 1;
+    }
+    *lo = a;
+    *hi = b;
+}
+
+/* Build the im2col matrix for C channels starting at `src`:
+ *   col: [C*KH*KW, OH*OW], col[r, oh*OW+ow] = src[c, oh*sh + i*dh - ph, ow*sw + j*dw - pw]
  * out-of-bounds reads (padding) yield 0. */
-static void im2col2d(const FeTensor *input, int n,
-                     float *col, int C_in, int H, int W,
+static void im2col2d(const float *src, float *col, int C, int H, int W,
                      int KH, int KW, int OH, int OW,
-                     int sh, int sw, int ph, int pw) {
-    const float *src = (const float *)input->data + (size_t)n * C_in * H * W;
-    size_t rows = (size_t)C_in * KH * KW;
-    memset(col, 0, rows * (size_t)OH * OW * sizeof(float));
+                     int sh, int sw, int ph, int pw, int dh, int dw) {
+    size_t plane = (size_t)OH * OW;
+    memset(col, 0, (size_t)C * KH * KW * plane * sizeof(float));
 
     size_t r = 0;
-    for (int c = 0; c < C_in; c++) {
+    for (int c = 0; c < C; c++) {
+        const float *chan = src + (size_t)c * H * W;
         for (int i = 0; i < KH; i++) {
-            for (int j = 0; j < KW; j++) {
-                for (int oh = 0; oh < OH; oh++) {
-                    for (int ow = 0; ow < OW; ow++) {
-                        int ih = oh * sh + i - ph;
-                        int iw = ow * sw + j - pw;
-                        if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
-                        col[r * OH * OW + oh * OW + ow] =
-                            src[((size_t)c * H + ih) * W + iw];
-                    }
+            int oh_lo, oh_hi;
+            valid_range(OH, sh, i * dh - ph, H, &oh_lo, &oh_hi);
+            for (int j = 0; j < KW; j++, r++) {
+                int ow_lo, ow_hi;
+                valid_range(OW, sw, j * dw - pw, W, &ow_lo, &ow_hi);
+                if (ow_lo >= ow_hi) continue;
+                float *row = col + r * plane;
+                for (int oh = oh_lo; oh < oh_hi; oh++) {
+                    const float *s = chan + (size_t)(oh * sh + i * dh - ph) * W
+                                          + (ow_lo * sw + j * dw - pw);
+                    float *d = row + (size_t)oh * OW + ow_lo;
+                    int n = ow_hi - ow_lo;
+                    if (sw == 1) memcpy(d, s, (size_t)n * sizeof(float));
+                    else for (int k = 0; k < n; k++) d[k] = s[(size_t)k * sw];
                 }
-                r++;
             }
         }
     }
 }
 
-FeStatus fe_conv2d(const FeTensor *input, const FeTensor *weight,
-                   const FeTensor *bias, FeTensor *out,
-                   int sh, int sw, int ph, int pw) {
+/* A non-owning 2-D view over contiguous float data. */
+static void view2d(FeTensor *t, float *data, int rows, int cols) {
+    t->data = data; t->dtype = DTYPE_FLOAT32; t->ndim = 2;
+    t->shape[0] = rows; t->shape[1] = cols;
+    t->strides[0] = cols; t->strides[1] = 1;
+    t->nbytes = (size_t)rows * cols * sizeof(float);
+    t->owns_data = false;
+}
+
+/* Depthwise: every output channel reads exactly one input channel. Each kernel tap
+ * adds a scaled, shifted copy of the input plane to the output plane, which the
+ * compiler vectorises when the stride is 1. */
+static void depthwise(const float *in, const float *w, const float *bias, float *out,
+                      int C_in, int mult, int H, int W, int KH, int KW,
+                      int OH, int OW, int sh, int sw, int ph, int pw, int dh, int dw) {
+    size_t plane = (size_t)OH * OW;
+    for (int c = 0; c < C_in; c++) {
+        const float *chan = in + (size_t)c * H * W;
+        for (int m = 0; m < mult; m++) {
+            int oc = c * mult + m;
+            float *o = out + (size_t)oc * plane;
+            float b = bias ? bias[oc] : 0.0f;
+            for (size_t k = 0; k < plane; k++) o[k] = b;
+
+            const float *kern = w + (size_t)oc * KH * KW;
+            for (int i = 0; i < KH; i++) {
+                int oh_lo, oh_hi;
+                valid_range(OH, sh, i * dh - ph, H, &oh_lo, &oh_hi);
+                for (int j = 0; j < KW; j++) {
+                    int ow_lo, ow_hi;
+                    valid_range(OW, sw, j * dw - pw, W, &ow_lo, &ow_hi);
+                    float kv = kern[i * KW + j];
+                    int n = ow_hi - ow_lo;
+                    if (n <= 0 || kv == 0.0f) continue;
+                    for (int oh = oh_lo; oh < oh_hi; oh++) {
+                        const float *s = chan + (size_t)(oh * sh + i * dh - ph) * W
+                                              + (ow_lo * sw + j * dw - pw);
+                        float *d = o + (size_t)oh * OW + ow_lo;
+                        if (sw == 1) for (int k = 0; k < n; k++) d[k] += kv * s[k];
+                        else for (int k = 0; k < n; k++) d[k] += kv * s[(size_t)k * sw];
+                    }
+                }
+            }
+        }
+    }
+}
+
+FeStatus fe_conv2d_ex(const FeTensor *input, const FeTensor *weight,
+                      const FeTensor *bias, FeTensor *out,
+                      int sh, int sw, int ph, int pw,
+                      int dh, int dw, int groups) {
     if (!input || !weight || !out) return FE_ERR_NULL;
     if (input->ndim  != 4) return FE_ERR_SHAPE;
     if (weight->ndim != 4) return FE_ERR_SHAPE;
@@ -51,60 +124,82 @@ FeStatus fe_conv2d(const FeTensor *input, const FeTensor *weight,
     int H = input->shape[2], W = input->shape[3];
 
     int C_out = weight->shape[0];
+    int Cg = weight->shape[1];           /* input channels per group */
     int KH = weight->shape[2], KW = weight->shape[3];
-    if (weight->shape[1] != C_in) return FE_ERR_SHAPE;
     if (sh < 1 || sw < 1 || ph < 0 || pw < 0) return FE_ERR_SHAPE;
+    if (dh < 1 || dw < 1 || groups < 1) return FE_ERR_SHAPE;
+    if (Cg * groups != C_in || C_out % groups != 0) return FE_ERR_SHAPE;
 
-    int OH = (H - KH + 2 * ph) / sh + 1;
-    int OW = (W - KW + 2 * pw) / sw + 1;
+    int OH = (H + 2 * ph - (dh * (KH - 1) + 1)) / sh + 1;
+    int OW = (W + 2 * pw - (dw * (KW - 1) + 1)) / sw + 1;
     if (OH < 1 || OW < 1) return FE_ERR_SHAPE;
     if (out->shape[0] != N || out->shape[1] != C_out ||
         out->shape[2] != OH || out->shape[3] != OW) return FE_ERR_SHAPE;
     if (input->dtype != DTYPE_FLOAT32 || weight->dtype != DTYPE_FLOAT32 ||
         out->dtype != DTYPE_FLOAT32) return FE_ERR_DTYPE;
+    if (bias && (bias->dtype != DTYPE_FLOAT32 || fe_tensor_numel(bias) != C_out))
+        return FE_ERR_SHAPE;
 
-    int K = C_in * KH * KW;              /* rows of the im2col matrix */
+    const float *in_data = (const float *)input->data;
+    const float *w_data  = (const float *)weight->data;
+    const float *b_data  = bias ? (const float *)bias->data : NULL;
+    float *out_data = (float *)out->data;
+    size_t in_plane = (size_t)H * W, out_plane = (size_t)OH * OW;
 
-    float *col = malloc((size_t)K * OH * OW * sizeof(float));
-    if (!col) return FE_ERR_NOMEM;
+    if (Cg == 1 && groups == C_in) {
+        for (int n = 0; n < N; n++)
+            depthwise(in_data + (size_t)n * C_in * in_plane, w_data, b_data,
+                      out_data + (size_t)n * C_out * out_plane,
+                      C_in, C_out / C_in, H, W, KH, KW, OH, OW,
+                      sh, sw, ph, pw, dh, dw);
+        return FE_OK;
+    }
 
-    FeTensor colT;
-    colT.data = col; colT.dtype = DTYPE_FLOAT32; colT.ndim = 2;
-    colT.shape[0] = K; colT.shape[1] = OH * OW;
-    colT.strides[0] = OH * OW; colT.strides[1] = 1;
-    colT.nbytes = (size_t)K * OH * OW * sizeof(float);
-    colT.owns_data = false;
+    int Og = C_out / groups;             /* output channels per group */
+    int K = Cg * KH * KW;                /* rows of the im2col matrix */
+    int pointwise = KH == 1 && KW == 1 && sh == 1 && sw == 1 && ph == 0 && pw == 0;
 
-    /* Weight as [C_out, K] — same memory, reshaped view. */
-    int wshape[] = {C_out, K};
-    FeTensor *Wview = fe_tensor_reshape(weight, 2, wshape);
-    if (!Wview) { free(col); return FE_ERR_SHAPE; }
+    float *col = NULL;
+    if (!pointwise) {
+        col = malloc((size_t)K * out_plane * sizeof(float));
+        if (!col) return FE_ERR_NOMEM;
+    }
 
     FeStatus s = FE_OK;
     for (int n = 0; n < N && s == FE_OK; n++) {
-        im2col2d(input, n, col, C_in, H, W, KH, KW, OH, OW, sh, sw, ph, pw);
+        for (int g = 0; g < groups && s == FE_OK; g++) {
+            const float *src = in_data + ((size_t)n * C_in + (size_t)g * Cg) * in_plane;
+            FeTensor colT, Wview, out_slice;
+            if (pointwise) {
+                /* Read-only: GEMM never writes its inputs. */
+                view2d(&colT, (float *)(size_t)src, K, (int)out_plane);
+            } else {
+                im2col2d(src, col, Cg, H, W, KH, KW, OH, OW, sh, sw, ph, pw, dh, dw);
+                view2d(&colT, col, K, (int)out_plane);
+            }
+            view2d(&Wview, (float *)(size_t)(w_data + (size_t)g * Og * K), Og, K);
+            float *o = out_data + ((size_t)n * C_out + (size_t)g * Og) * out_plane;
+            view2d(&out_slice, o, Og, (int)out_plane);
 
-        FeTensor out_slice;
-        out_slice.data = (float *)out->data + (size_t)n * C_out * OH * OW;
-        out_slice.dtype = DTYPE_FLOAT32; out_slice.ndim = 2;
-        out_slice.shape[0] = C_out; out_slice.shape[1] = OH * OW;
-        out_slice.strides[0] = OH * OW; out_slice.strides[1] = 1;
-        out_slice.nbytes = (size_t)C_out * OH * OW * sizeof(float);
-        out_slice.owns_data = false;
+            s = fe_matmul(&Wview, &colT, &out_slice);
+            if (s != FE_OK) break;
 
-        s = fe_matmul(Wview, &colT, &out_slice);
-        if (s != FE_OK) break;
-
-        if (bias) {
-            const float *b = (const float *)bias->data;
-            float *o = (float *)out_slice.data;
-            for (int oc = 0; oc < C_out; oc++)
-                for (int px = 0; px < OH * OW; px++)
-                    o[(size_t)oc * OH * OW + px] += b[oc];
+            if (b_data) {
+                for (int oc = 0; oc < Og; oc++) {
+                    float b = b_data[g * Og + oc];
+                    float *row = o + (size_t)oc * out_plane;
+                    for (size_t px = 0; px < out_plane; px++) row[px] += b;
+                }
+            }
         }
     }
 
-    fe_tensor_free(Wview);
     free(col);
     return s;
+}
+
+FeStatus fe_conv2d(const FeTensor *input, const FeTensor *weight,
+                   const FeTensor *bias, FeTensor *out,
+                   int sh, int sw, int ph, int pw) {
+    return fe_conv2d_ex(input, weight, bias, out, sh, sw, ph, pw, 1, 1, 1);
 }

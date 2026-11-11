@@ -204,6 +204,12 @@ static const char *op_name(FeOpType op) {
         case FE_OP_MULTIHEAD_ATTN: return "MHA";
         case FE_OP_EMBEDDING: return "Embedding";
         case FE_OP_POSITIONAL_ENCOD: return "PosEnc";
+        case FE_OP_CONCAT:           return "Concat";
+        case FE_OP_RESIZE:           return "Resize";
+        case FE_OP_CLIP:             return "Clip";
+        case FE_OP_GLOBAL_AVGPOOL:   return "GlobalAvgPool";
+        case FE_OP_PRELU:            return "PRelu";
+        case FE_OP_PAD:              return "Pad";
         default:              return "Unknown";
     }
 }

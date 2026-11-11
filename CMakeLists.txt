@@ -210,6 +210,7 @@ add_library(ferrite_ops STATIC
     ops/reduce.c
     ops/sequence.c
     ops/stability.c
+    ops/vision.c
 )
 target_link_libraries(ferrite_ops PUBLIC ferrite_core ferrite_simd)
 
@@ -306,6 +307,7 @@ add_executable(test_tensor      tests/test_tensor.c)
 add_executable(test_allocator   tests/test_allocator.c)
 add_executable(test_ops         tests/test_ops.c)
 add_executable(test_ops3        tests/test_ops3.c)
+add_executable(test_vision      tests/test_vision.c)
 if(FERRITE_ENABLE_AVX2)
     add_executable(test_simd        tests/test_simd.c)
 endif()
@@ -363,6 +365,7 @@ target_link_libraries(test_tensor      ferrite_core)
 target_link_libraries(test_allocator   ferrite_core)
 target_link_libraries(test_ops         ferrite_core ferrite_ops ferrite_simd)
 target_link_libraries(test_ops3        ferrite_core ferrite_ops ferrite_simd)
+target_link_libraries(test_vision      ferrite_core ferrite_ops ferrite_simd)
 if(FERRITE_ENABLE_AVX2)
     target_link_libraries(test_simd    ferrite_core ferrite_ops ferrite_simd)
 endif()
@@ -386,7 +389,7 @@ if(FERRITE_ENABLE_IMPORTER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
-foreach(t test_tensor test_allocator test_ops test_ops3 test_graph test_engine
+foreach(t test_tensor test_allocator test_ops test_ops3 test_vision test_graph test_engine
         test_onnx test_planner test_conv1d test_profiler test_quant
         test_tensor_ser test_opt test_parallel test_compiler test_artifact
         test_error_contract)
@@ -471,3 +474,11 @@ target_link_libraries(run_model PRIVATE
     ferrite_planner ferrite_runtime ferrite_importer)
 target_compile_options(run_model PRIVATE -O2)
 ferrite_exe(run_model)
+
+# Image-model runner with heap buffers and timing; drives tools/vision_compare.py.
+add_executable(run_vision EXCLUDE_FROM_ALL tools/run_vision.c)
+target_link_libraries(run_vision PRIVATE
+    ferrite_core ferrite_graph ferrite_ops ferrite_simd
+    ferrite_planner ferrite_runtime ferrite_importer ferrite_tools)
+target_compile_options(run_vision PRIVATE -O2)
+ferrite_exe(run_vision)

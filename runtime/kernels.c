@@ -191,10 +191,12 @@ static FeStatus ex_softmax(FeRuntime *rt, FeNode *node) {
     return s;
 }
 
-static FeStatus ex_bias_add(FeRuntime *rt, FeNode *node) {
+/* ONNX Add: two same-shaped tensors, or any pair that broadcasts (a bias on the
+ * last dimension is the common case). fe_add handles both. */
+static FeStatus ex_add(FeRuntime *rt, FeNode *node) {
     FeGraph *g = rt->graph;
     EXEC_BEGIN();
-    FeStatus s = fe_bias_add(IN(0), IN(1), OUT(0));
+    FeStatus s = fe_add(IN(0), IN(1), OUT(0));
     EXEC_END();
     return s;
 }
@@ -350,10 +352,14 @@ static FeStatus ex_transpose(FeRuntime *rt, FeNode *node) {
 static FeStatus ex_conv2d(FeRuntime *rt, FeNode *node) {
     FeGraph *g = rt->graph;
     EXEC_BEGIN();
-    FeStatus s = fe_conv2d(IN(0), IN(1), node->n_inputs > 2 ? IN(2) : NULL,
-                           OUT(0),
-                           node->attrs.conv2d.stride_h, node->attrs.conv2d.stride_w,
-                           node->attrs.conv2d.pad_h,    node->attrs.conv2d.pad_w);
+    int dh = node->attrs.conv2d.dil_h > 0 ? node->attrs.conv2d.dil_h : 1;
+    int dw = node->attrs.conv2d.dil_w > 0 ? node->attrs.conv2d.dil_w : 1;
+    int groups = node->attrs.conv2d.groups > 0 ? node->attrs.conv2d.groups : 1;
+    FeStatus s = fe_conv2d_ex(IN(0), IN(1), node->n_inputs > 2 ? IN(2) : NULL,
+                              OUT(0),
+                              node->attrs.conv2d.stride_h, node->attrs.conv2d.stride_w,
+                              node->attrs.conv2d.pad_h,    node->attrs.conv2d.pad_w,
+                              dh, dw, groups);
     EXEC_END();
     return s;
 }
@@ -361,9 +367,10 @@ static FeStatus ex_conv2d(FeRuntime *rt, FeNode *node) {
 static FeStatus ex_maxpool(FeRuntime *rt, FeNode *node) {
     FeGraph *g = rt->graph;
     EXEC_BEGIN();
-    FeStatus s = fe_maxpool(IN(0), OUT(0), node->attrs.pool.kh,
-                            node->attrs.pool.kw, node->attrs.pool.sh,
-                            node->attrs.pool.sw);
+    FeStatus s = fe_maxpool_pad(IN(0), OUT(0), node->attrs.pool.kh,
+                                node->attrs.pool.kw, node->attrs.pool.sh,
+                                node->attrs.pool.sw, node->attrs.pool.ph,
+                                node->attrs.pool.pw);
     EXEC_END();
     return s;
 }
@@ -371,9 +378,10 @@ static FeStatus ex_maxpool(FeRuntime *rt, FeNode *node) {
 static FeStatus ex_avgpool(FeRuntime *rt, FeNode *node) {
     FeGraph *g = rt->graph;
     EXEC_BEGIN();
-    FeStatus s = fe_avgpool(IN(0), OUT(0), node->attrs.pool.kh,
-                            node->attrs.pool.kw, node->attrs.pool.sh,
-                            node->attrs.pool.sw);
+    FeStatus s = fe_avgpool_pad(IN(0), OUT(0), node->attrs.pool.kh,
+                                node->attrs.pool.kw, node->attrs.pool.sh,
+                                node->attrs.pool.sw, node->attrs.pool.ph,
+                                node->attrs.pool.pw);
     EXEC_END();
     return s;
 }
@@ -439,6 +447,59 @@ static FeStatus ex_posenc(FeRuntime *rt, FeNode *node) {
     return s;
 }
 
+static FeStatus ex_concat(FeRuntime *rt, FeNode *node) {
+    FeGraph *g = rt->graph;
+    EXEC_BEGIN();
+    const FeTensor *ins[FE_MAX_NODE_INPUTS];
+    for (int i = 0; i < node->n_inputs; i++) ins[i] = IN(i);
+    FeStatus s = fe_concat(ins, node->n_inputs, node->attrs.concat.axis, OUT(0));
+    EXEC_END();
+    return s;
+}
+
+static FeStatus ex_resize(FeRuntime *rt, FeNode *node) {
+    FeGraph *g = rt->graph;
+    EXEC_BEGIN();
+    FeStatus s = node->attrs.resize.mode == FE_RESIZE_LINEAR
+        ? fe_resize_bilinear(IN(0), OUT(0), node->attrs.resize.coord)
+        : fe_resize_nearest(IN(0), OUT(0));
+    EXEC_END();
+    return s;
+}
+
+static FeStatus ex_clip(FeRuntime *rt, FeNode *node) {
+    FeGraph *g = rt->graph;
+    EXEC_BEGIN();
+    FeStatus s = fe_clip(IN(0), OUT(0), node->attrs.clip.min, node->attrs.clip.max);
+    EXEC_END();
+    return s;
+}
+
+static FeStatus ex_global_avgpool(FeRuntime *rt, FeNode *node) {
+    FeGraph *g = rt->graph;
+    EXEC_BEGIN();
+    FeStatus s = fe_global_avgpool(IN(0), OUT(0));
+    EXEC_END();
+    return s;
+}
+
+static FeStatus ex_prelu(FeRuntime *rt, FeNode *node) {
+    FeGraph *g = rt->graph;
+    EXEC_BEGIN();
+    FeStatus s = fe_prelu(IN(0), IN(1), OUT(0));
+    EXEC_END();
+    return s;
+}
+
+static FeStatus ex_pad(FeRuntime *rt, FeNode *node) {
+    FeGraph *g = rt->graph;
+    EXEC_BEGIN();
+    FeStatus s = fe_pad2d(IN(0), OUT(0), node->attrs.pad.top, node->attrs.pad.left,
+                          node->attrs.pad.mode, node->attrs.pad.value);
+    EXEC_END();
+    return s;
+}
+
 #undef IN
 #undef OUT
 
@@ -453,7 +514,7 @@ static FeExecFn const k_fns[] = {
     [FE_OP_SOFTMAX]            = ex_softmax,
     [FE_OP_CONV1D]             = ex_conv1d,
     [FE_OP_BATCHNORM]          = ex_batchnorm,
-    [FE_OP_ADD]                = ex_bias_add,
+    [FE_OP_ADD]                = ex_add,
     [FE_OP_FLATTEN]            = ex_flatten,
     [FE_OP_SUB]                = ex_sub,
     [FE_OP_MUL]                = ex_mul,
@@ -479,6 +540,12 @@ static FeExecFn const k_fns[] = {
     [FE_OP_MULTIHEAD_ATTN]     = ex_multihead,
     [FE_OP_EMBEDDING]          = ex_embedding,
     [FE_OP_POSITIONAL_ENCOD]   = ex_posenc,
+    [FE_OP_CONCAT]             = ex_concat,
+    [FE_OP_RESIZE]             = ex_resize,
+    [FE_OP_CLIP]               = ex_clip,
+    [FE_OP_GLOBAL_AVGPOOL]     = ex_global_avgpool,
+    [FE_OP_PRELU]              = ex_prelu,
+    [FE_OP_PAD]                = ex_pad,
 };
 
 FeExecFn fe_kernels_get(int op) {

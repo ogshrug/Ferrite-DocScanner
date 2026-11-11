@@ -136,9 +136,80 @@ static int rule_conv2d(FeGraph *g, FeNode *node) {
     int C_out = w->shape[0], KH = w->shape[2], KW = w->shape[3];
     int sh = node->attrs.conv2d.stride_h, sw = node->attrs.conv2d.stride_w;
     int ph = node->attrs.conv2d.pad_h,    pw = node->attrs.conv2d.pad_w;
+    int dh = node->attrs.conv2d.dil_h > 0 ? node->attrs.conv2d.dil_h : 1;
+    int dw = node->attrs.conv2d.dil_w > 0 ? node->attrs.conv2d.dil_w : 1;
+    if (sh < 1 || sw < 1) return -1;
     int rs[4] = { in->shape[0], C_out,
-                  (H - KH + 2 * ph) / sh + 1,
-                  (W - KW + 2 * pw) / sw + 1 };
+                  (H + 2 * ph - (dh * (KH - 1) + 1)) / sh + 1,
+                  (W + 2 * pw - (dw * (KW - 1) + 1)) / sw + 1 };
+    if (rs[2] < 1 || rs[3] < 1) return -1;
+    set_shape(out, 4, rs);
+    return 1;
+}
+
+static int rule_concat(FeGraph *g, FeNode *node) {
+    FeTensorEntry *out = &g->tensors[node->outputs[0]];
+    if (is_known(out) || node->n_inputs < 1) return 0;
+    FeTensorEntry *first = &g->tensors[node->inputs[0]];
+    if (!is_known(first)) return 0;
+    int nd = first->ndim;
+    int axis = node->attrs.concat.axis < 0 ? node->attrs.concat.axis + nd
+                                           : node->attrs.concat.axis;
+    if (axis < 0 || axis >= nd) return -1;
+    int rs[FERRITE_MAX_DIMS];
+    memcpy(rs, first->shape, nd * sizeof(int));
+    for (int i = 1; i < node->n_inputs; i++) {
+        FeTensorEntry *e = &g->tensors[node->inputs[i]];
+        if (!is_known(e)) return 0;
+        if (e->ndim != nd) return -1;
+        for (int d = 0; d < nd; d++)
+            if (d != axis && e->shape[d] != rs[d]) return -1;
+        rs[axis] += e->shape[axis];
+    }
+    set_shape(out, nd, rs);
+    return 1;
+}
+
+static int rule_resize(FeGraph *g, FeNode *node) {
+    FeTensorEntry *in  = &g->tensors[node->inputs[0]];
+    FeTensorEntry *out = &g->tensors[node->outputs[0]];
+    if (is_known(out) || !is_known(in)) return 0;
+    if (in->ndim != 4) return -1;
+    int oh = node->attrs.resize.out_h, ow = node->attrs.resize.out_w;
+    if (oh <= 0 || ow <= 0) {
+        /* ONNX: output = floor(input * scale). */
+        oh = (int)((float)in->shape[2] * node->attrs.resize.scale_h);
+        ow = (int)((float)in->shape[3] * node->attrs.resize.scale_w);
+    }
+    if (oh < 1 || ow < 1) return -1;
+    int rs[4] = { in->shape[0], in->shape[1], oh, ow };
+    set_shape(out, 4, rs);
+    return 1;
+}
+
+static int rule_global_avgpool(FeGraph *g, FeNode *node) {
+    FeTensorEntry *in  = &g->tensors[node->inputs[0]];
+    FeTensorEntry *out = &g->tensors[node->outputs[0]];
+    if (is_known(out) || !is_known(in)) return 0;
+    if (in->ndim != 4) return -1;
+    int rs[4] = { in->shape[0], in->shape[1], 1, 1 };
+    set_shape(out, 4, rs);
+    return 1;
+}
+
+static int rule_pad(FeGraph *g, FeNode *node) {
+    FeTensorEntry *in  = &g->tensors[node->inputs[0]];
+    FeTensorEntry *out = &g->tensors[node->outputs[0]];
+    if (is_known(out) || !is_known(in)) return 0;
+    if (in->ndim != 4) return -1;
+    int rs[4] = { in->shape[0], in->shape[1],
+                  in->shape[2] + node->attrs.pad.top  + node->attrs.pad.bottom,
+                  in->shape[3] + node->attrs.pad.left + node->attrs.pad.right };
+    /* Reflection needs a sample to mirror: pads must be smaller than the image. */
+    if (node->attrs.pad.mode == 1 &&
+        (node->attrs.pad.top >= in->shape[2] || node->attrs.pad.bottom >= in->shape[2] ||
+         node->attrs.pad.left >= in->shape[3] || node->attrs.pad.right >= in->shape[3]))
+        return -1;
     set_shape(out, 4, rs);
     return 1;
 }
@@ -150,8 +221,8 @@ static int rule_pool(FeGraph *g, FeNode *node) {
     if (is_known(out) || !is_known(in) || (in->ndim != 3 && in->ndim != 4))
         return 0;
     int H = in->shape[in->ndim - 2], W = in->shape[in->ndim - 1];
-    int oh = (H - node->attrs.pool.kh) / node->attrs.pool.sh + 1;
-    int ow = (W - node->attrs.pool.kw) / node->attrs.pool.sw + 1;
+    int oh = (H + 2 * node->attrs.pool.ph - node->attrs.pool.kh) / node->attrs.pool.sh + 1;
+    int ow = (W + 2 * node->attrs.pool.pw - node->attrs.pool.kw) / node->attrs.pool.sw + 1;
     int rs[FERRITE_MAX_DIMS];
     if (in->ndim == 4) {
         rs[0] = in->shape[0]; rs[1] = in->shape[1]; rs[2] = oh; rs[3] = ow;
@@ -241,8 +312,14 @@ FeStatus fe_infer_shapes(FeGraph *g) {
                 case FE_OP_FLATTEN:     r = rule_flatten(g, node);    break;
                 case FE_OP_EMBEDDING:   r = rule_embedding(g, node);  break;
                 case FE_OP_MULTIHEAD_ATTN:
+                case FE_OP_CLIP:
+                case FE_OP_PRELU:
                     r = rule_same_shape(g, node);
                     break;
+                case FE_OP_CONCAT:         r = rule_concat(g, node);         break;
+                case FE_OP_RESIZE:         r = rule_resize(g, node);         break;
+                case FE_OP_GLOBAL_AVGPOOL: r = rule_global_avgpool(g, node); break;
+                case FE_OP_PAD:            r = rule_pad(g, node);            break;
             }
             if (r < 0) return FE_ERR_SHAPE;   /* geometry contradiction */
             if (r > 0) changed = 1;

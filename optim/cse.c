@@ -31,6 +31,13 @@ static int attrs_equal(FeOpType op, const FeNode *a, const FeNode *b) {
                                              sizeof(a->attrs.gemm)) == 0;
         case FE_OP_MULTIHEAD_ATTN:
             return a->attrs.multihead.num_heads == b->attrs.multihead.num_heads;
+        case FE_OP_CONCAT:     return a->attrs.concat.axis == b->attrs.concat.axis;
+        case FE_OP_RESIZE:     return memcmp(&a->attrs.resize, &b->attrs.resize,
+                                             sizeof(a->attrs.resize)) == 0;
+        case FE_OP_CLIP:       return a->attrs.clip.min == b->attrs.clip.min &&
+                                      a->attrs.clip.max == b->attrs.clip.max;
+        case FE_OP_PAD:        return memcmp(&a->attrs.pad, &b->attrs.pad,
+                                             sizeof(a->attrs.pad)) == 0;
         default:               return 1;   /* op carries no attributes */
     }
 }

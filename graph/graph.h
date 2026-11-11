@@ -62,7 +62,18 @@ typedef enum {
     FE_OP_MULTIHEAD_ATTN    = 31,
     FE_OP_EMBEDDING         = 32,
     FE_OP_POSITIONAL_ENCOD  = 33,
+
+    /* Vision — the rest of what convolutional image models need */
+    FE_OP_CONCAT            = 34,
+    FE_OP_RESIZE            = 35,
+    FE_OP_CLIP              = 36,
+    FE_OP_GLOBAL_AVGPOOL    = 37,
+    FE_OP_PRELU             = 38,
+    FE_OP_PAD               = 39,
 } FeOpType;
+
+/* One past the last operator; sizes tables indexed by FeOpType. */
+#define FE_OP_COUNT 40
 
 /*
  * A tensor entry in the graph's tensor registry.
@@ -110,8 +121,17 @@ struct FeNode {
         struct { int stride; int pad; }      conv1d;
         struct { float negative_slope; }     leaky_relu;
         struct { float alpha; }              elu;
-        struct { int stride_h, stride_w, pad_h, pad_w; } conv2d;
-        struct { int kh, kw, sh, sw; }       pool;
+        /* dil_* and groups read as 1 when left at 0, so graphs built by hand
+         * with only stride and pad set keep working. */
+        struct { int stride_h, stride_w, pad_h, pad_w;
+                 int dil_h, dil_w, groups; }  conv2d;
+        struct { int kh, kw, sh, sw, ph, pw; } pool;
+        struct { int axis; }                 concat;
+        /* Output size is out_h x out_w when set, else input size x scale. */
+        struct { int out_h, out_w; float scale_h, scale_w;
+                 int mode, coord; }          resize;
+        struct { float min, max; }           clip;
+        struct { int top, left, bottom, right, mode; float value; } pad;
         struct { float eps; }                layernorm;
         struct { int groups; float eps; }    groupnorm;
         struct { float eps; }                batchnorm;

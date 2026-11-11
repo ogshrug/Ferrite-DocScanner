@@ -4,6 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Website](https://img.shields.io/badge/site-ferrite--c11.github.io-a51c30)](https://ferrite-c11.github.io/FerriteWebsite/)
 
+> **This is Ferrite-DocScanner**, a fork of [Ferrite](https://github.com/AaravGupta17/Ferrite)
+> extended to run the two models in [FlatDocScanner](https://github.com/ogshrug/FlatDocScanner):
+> DocAligner LCNet-100 (page corners) and UVDoc (curved-page flattening). Both load and
+> match ONNX Runtime; see [What the fork adds](#what-the-fork-adds) below.
+
 **A neural-network inference runtime in 222 KB of C11, with zero dependencies.**
 
 It parses ONNX protobufs with its own wire parser, plans activation memory with its
@@ -212,6 +217,87 @@ exactly this reason. Full numbers and methodology: [`docs/benchmarks.md`](docs/b
 - Calibration collects raw `max(|x|)` activation ranges; percentile smoothing is not
   built.
 - ESP32 hardware validation is a documented manual step; CI is a compile gate.
+
+---
+
+## What the fork adds
+
+Everything below keeps Ferrite's rules: libc only, kernels that don't allocate (the
+im2col scratch excepted, as before), and loud failure on anything unsupported.
+
+**Operators**
+
+- `Conv` with `group` and `dilations`. Depthwise convolutions (`group == C_in`) run a
+  direct kernel with no scratch buffer; 1x1 stride-1 convolutions skip im2col and go
+  straight to GEMM. Asymmetric padding and `auto_pad` are refused.
+- `MaxPool` / `AveragePool` with symmetric `pads` (previously ignored with a warning).
+- `Concat`, `Resize` (linear with half_pixel / align_corners / asymmetric, and nearest
+  with asymmetric), `Clip`, `PRelu`, `Pad` (constant / reflect / edge, on H and W), and
+  `GlobalAveragePool` (also reached as `ReduceMean` over axes 2 and 3).
+- `Add`, `Sub`, `Mul`, `Div` broadcast with NumPy rules.
+
+**Importer**
+
+- INT32 / INT64 initializers (shapes, pads, axes) and scalars load, converted to float32.
+- `Resize`, `Pad` and `Clip` read their sizes, pads and bounds from constant inputs,
+  and an omitted optional input (an empty name) no longer shifts the ones after it.
+
+**Fixes to existing behaviour**
+
+- ONNX `Add` of two same-shaped tensors ran as a bias add over the last dimension,
+  which gives wrong results; it is now an element-wise add.
+- `float_data` was read from TensorProto field 7, which is `int64_data`; it is field 4.
+  Fixed32 values in field 7 still load, so files written against the old reading keep
+  working.
+- A node with more than 8 inputs silently dropped the extras; it is now refused.
+- The FEMD artifact writer refuses nodes whose new attributes it has no field for,
+  rather than dropping them.
+
+**Faster GEMM on AVX2**
+
+The old kernel kept a 64-row tile of accumulators "in registers"; AVX2 has 16, so most
+lived in memory and every FMA also paid a load and a store. It is now a 6x16
+register-blocked micro-kernel (12 accumulators) over packed 16-column panels of B.
+Measured on an AMD Ryzen 5 5600, single-threaded, same machine before and after:
+
+```sh
+cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DFERRITE_SANITIZE=OFF
+cmake --build build-release --target bench_avx2 bench_model
+./build-release/bench_avx2 && ./build-release/bench_model
+```
+
+| | before | after |
+|---|---|---|
+| MatMul 256x256x256 | 1.23 ms (27 GFLOPS) | 0.34 ms (100 GFLOPS) |
+| AcousticLeakNet inference | 2.67 ms | 2.32 ms |
+
+**The scanner's models**
+
+`tools/prepare_model.py` rewrites a model into what Ferrite loads, without changing
+what it computes (it checks this against the original before writing): ONNX Runtime's
+basic optimisation folds constants and Conv+BatchNorm, and DocAligner's weighted sums
+(`Unsqueeze` + `Concat` + `Einsum`) become `Mul` and `Add`. `tools/vision_compare.py`
+then runs a model in Ferrite and in ONNX Runtime on the same synthetic photo:
+
+```sh
+python tools/prepare_model.py docaligner_lcnet100.onnx prep/docaligner_lcnet100.onnx
+python tools/prepare_model.py uvdoc.onnx prep/uvdoc.onnx
+cmake --build build-release --target run_vision
+python tools/vision_compare.py --run-vision build-release/run_vision prep/*.onnx
+```
+
+Ryzen 5 5600, one thread each:
+
+| Model | Max difference from ONNX Runtime | Ferrite | ONNX Runtime 1.30 |
+|---|---|---|---|
+| DocAligner LCNet-100, 256x256 | 5.5e-6 | 76 ms | 27 ms |
+| UVDoc, 712x488 | 1.9e-6 | 671 ms | 321 ms |
+
+Before the GEMM change Ferrite took 90 ms and 1464 ms on these. It is still 2 to 3
+times slower than ONNX Runtime, and there is no NEON kernel yet, so on a phone it would
+fall back to scalar code.
+
+`tests/test_vision.c` checks every new kernel against a direct reference.
 
 ---
 

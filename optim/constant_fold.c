@@ -96,17 +96,22 @@ static FeStatus fold_node(FeGraph *g, FeNode *node, FeArena *arena) {
                           node->attrs.conv1d.stride, node->attrs.conv1d.pad);
             break;
         case FE_OP_CONV2D:
-            s = fe_conv2d(IN(0), IN(1),
-                          node->n_inputs > 2 ? IN(2) : NULL, OUT(0),
-                          node->attrs.conv2d.stride_h, node->attrs.conv2d.stride_w,
-                          node->attrs.conv2d.pad_h,    node->attrs.conv2d.pad_w);
+            s = fe_conv2d_ex(IN(0), IN(1),
+                             node->n_inputs > 2 ? IN(2) : NULL, OUT(0),
+                             node->attrs.conv2d.stride_h, node->attrs.conv2d.stride_w,
+                             node->attrs.conv2d.pad_h,    node->attrs.conv2d.pad_w,
+                             node->attrs.conv2d.dil_h > 0 ? node->attrs.conv2d.dil_h : 1,
+                             node->attrs.conv2d.dil_w > 0 ? node->attrs.conv2d.dil_w : 1,
+                             node->attrs.conv2d.groups > 0 ? node->attrs.conv2d.groups : 1);
             break;
         case FE_OP_MAXPOOL:
-            s = fe_maxpool(IN(0), OUT(0), node->attrs.pool.kh, node->attrs.pool.kw,
-                           node->attrs.pool.sh, node->attrs.pool.sw); break;
+            s = fe_maxpool_pad(IN(0), OUT(0), node->attrs.pool.kh, node->attrs.pool.kw,
+                               node->attrs.pool.sh, node->attrs.pool.sw,
+                               node->attrs.pool.ph, node->attrs.pool.pw); break;
         case FE_OP_AVGPOOL:
-            s = fe_avgpool(IN(0), OUT(0), node->attrs.pool.kh, node->attrs.pool.kw,
-                           node->attrs.pool.sh, node->attrs.pool.sw); break;
+            s = fe_avgpool_pad(IN(0), OUT(0), node->attrs.pool.kh, node->attrs.pool.kw,
+                               node->attrs.pool.sh, node->attrs.pool.sw,
+                               node->attrs.pool.ph, node->attrs.pool.pw); break;
         case FE_OP_BATCHNORM:
             s = fe_batchnorm(IN(0), IN(1), IN(2), IN(3), IN(4), OUT(0),
                              node->attrs.batchnorm.eps); break;

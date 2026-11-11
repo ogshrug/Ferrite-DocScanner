@@ -1,4 +1,5 @@
 // importer/onnx.c
+#include "ops.h"
 #include "onnx.h"
 #include "tensor.h"
 #include "optim.h"
@@ -6,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <float.h>
 #include <assert.h>
 
 /* ------------------------------------------------------------------ */
@@ -145,6 +147,14 @@ static FeOpType op_type_from_string(const char *s) {
     if (strcmp(s, "GroupNormalization")       == 0) return FE_OP_GROUPNORM;
     /* ---- Sequence (ONNX contrib opset 'MultiHeadAttention') ---- */
     if (strcmp(s, "MultiHeadAttention")       == 0) return FE_OP_MULTIHEAD_ATTN;
+    /* ---- Vision ---- */
+    if (strcmp(s, "Concat")            == 0) return FE_OP_CONCAT;
+    if (strcmp(s, "Resize")            == 0) return FE_OP_RESIZE;
+    if (strcmp(s, "Clip")              == 0) return FE_OP_CLIP;
+    if (strcmp(s, "GlobalAveragePool") == 0) return FE_OP_GLOBAL_AVGPOOL;
+    if (strcmp(s, "ReduceMean")        == 0) return FE_OP_GLOBAL_AVGPOOL; /* axes checked in parse_node */
+    if (strcmp(s, "PRelu")             == 0) return FE_OP_PRELU;
+    if (strcmp(s, "Pad")               == 0) return FE_OP_PAD;
     return (FeOpType)-1;   /* unsupported */
 }
 
@@ -177,11 +187,34 @@ static int find_or_add_tensor(FeGraph *g, const char *name) {
  * TensorProto field numbers:
  *   1 = dims      (repeated int64)
  *   2 = data_type (int32)
- *   7 = float_data (repeated float — used by some exporters for small
- *                   weight tensors instead of packed raw_data)
+ *   4 = float_data (repeated float, packed or not — used by some exporters
+ *                   for small weight tensors instead of raw_data)
+ *   7 = int64_data (repeated int64, packed or not)
  *   8 = name      (string)
- *   9 = raw_data  (bytes — float32 values packed)
+ *   9 = raw_data  (bytes — values packed little-endian)
+ *
+ * FLOAT (1) loads as is. INT32 (6) and INT64 (7) tensors, which ONNX uses for
+ * shapes, pads and axes, are converted to float32 so that the rest of the
+ * runtime has one weight type; they are small integers, which float32 holds
+ * exactly. A scalar (no dims) loads as a one-element vector.
+ *
+ * Fixed32 values in field 7 are also read as floats: earlier versions of this
+ * parser took field 7 for float_data, and files written against that keep
+ * loading.
  */
+/* Appends one value to a growing float buffer. Returns 0 when out of memory. */
+static int push_value(float **vals, size_t *n, size_t *cap, float v) {
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 64;
+        float *nf = (float *)realloc(*vals, nc * sizeof(float));
+        if (!nf) return 0;
+        *vals = nf;
+        *cap = nc;
+    }
+    (*vals)[(*n)++] = v;
+    return 1;
+}
+
 static FeStatus parse_initializer(FePbReader *r, FeGraph *g,
                                    FeArena *weight_arena) {
     char    name[FE_NAME_LEN] = {0};
@@ -217,19 +250,45 @@ static FeStatus parse_initializer(FePbReader *r, FeGraph *g,
                 dims[ndim++] = (int)fe_pb_varint(r);
                 break;
             case 2: data_type = (int)fe_pb_varint(r); break;
-            case 7: /* float_data — repeated float */
-                if (wtype != 5) { fe_pb_skip(r, wtype); break; }
-                if (data_type != 0 && data_type != 1) break;  /* not float32 */
-                {
+            case 4: /* float_data */
+            case 7: /* int64_data; fixed32 here is legacy float_data */
+                if (wtype == 5) {
                     uint32_t bits = fe_pb_fixed32(r);
-                    if (n_fvals == cap_fvals) {
-                        size_t nc = cap_fvals ? cap_fvals * 2 : 64;
-                        float *nf = (float *)realloc(fvals, nc * sizeof(float));
-                        if (!nf) { free(fvals); return FE_ERR_NOMEM; }
-                        fvals = nf;
-                        cap_fvals = nc;
+                    float v;
+                    memcpy(&v, &bits, 4);
+                    if (!push_value(&fvals, &n_fvals, &cap_fvals, v)) {
+                        free(fvals);
+                        return FE_ERR_NOMEM;
                     }
-                    memcpy(&fvals[n_fvals++], &bits, 4);
+                } else if (wtype == 0 && field == 7) {
+                    float v = (float)(int64_t)fe_pb_varint(r);
+                    if (!push_value(&fvals, &n_fvals, &cap_fvals, v)) {
+                        free(fvals);
+                        return FE_ERR_NOMEM;
+                    }
+                } else if (wtype == 2) {
+                    /* Packed: one length-delimited run of values. */
+                    const unsigned char *pd;
+                    size_t pl;
+                    if (!fe_pb_bytes(r, &pd, &pl)) { free(fvals); return FE_ERR_SHAPE; }
+                    FePbReader pr;
+                    fe_pb_init(&pr, pd, pl);
+                    while (!fe_pb_done(&pr)) {
+                        float v;
+                        if (field == 4) {
+                            if (pr.pos + 4 > pr.len) { free(fvals); return FE_ERR_SHAPE; }
+                            uint32_t bits = fe_pb_fixed32(&pr);
+                            memcpy(&v, &bits, 4);
+                        } else {
+                            v = (float)(int64_t)fe_pb_varint(&pr);
+                        }
+                        if (!push_value(&fvals, &n_fvals, &cap_fvals, v)) {
+                            free(fvals);
+                            return FE_ERR_NOMEM;
+                        }
+                    }
+                } else {
+                    fe_pb_skip(r, wtype);
                 }
                 break;
             case 8: pb_string(r, name, FE_NAME_LEN); break;
@@ -246,7 +305,21 @@ static FeStatus parse_initializer(FePbReader *r, FeGraph *g,
         }
     }
 
-    if (ndim == 0) { free(fvals); return FE_ERR_SHAPE; }
+    /* A scalar has no dims; give it one so it is an ordinary tensor. An
+     * initializer with neither dims nor data is still malformed. */
+    if (ndim == 0) {
+        if (!raw_data && n_fvals == 0) { free(fvals); return FE_ERR_SHAPE; }
+        dims[0] = 1;
+        ndim = 1;
+    }
+
+    if (data_type != 0 && data_type != 1 && data_type != 6 && data_type != 7) {
+        fprintf(stderr, "ONNX: initializer '%s' has unsupported data type %d "
+                "(float32, int32 and int64 load)\n",
+                name[0] ? name : "(unnamed)", data_type);
+        free(fvals);
+        return FE_ERR_DTYPE;
+    }
 
     /*
      * Bounds: reject absurd dims before integer overflow can bite.
@@ -285,7 +358,25 @@ static FeStatus parse_initializer(FePbReader *r, FeGraph *g,
                                        DTYPE_FLOAT32, ndim, dims);
     if (!e->tensor) { free(fvals); return FE_ERR_NOMEM; }
 
-    if (raw_data) {
+    if (raw_data && data_type == 7) {
+        if (raw_len != (size_t)(numel * 8)) { free(fvals); return FE_ERR_SHAPE; }
+        float *dst = (float *)e->tensor->data;
+        for (int64_t k = 0; k < numel; k++) {
+            uint64_t bits = 0;
+            for (int b = 0; b < 8; b++)
+                bits |= (uint64_t)raw_data[k * 8 + b] << (8 * b);
+            dst[k] = (float)(int64_t)bits;
+        }
+    } else if (raw_data && data_type == 6) {
+        if (raw_len != (size_t)(numel * 4)) { free(fvals); return FE_ERR_SHAPE; }
+        float *dst = (float *)e->tensor->data;
+        for (int64_t k = 0; k < numel; k++) {
+            uint32_t bits = 0;
+            for (int b = 0; b < 4; b++)
+                bits |= (uint32_t)raw_data[k * 4 + b] << (8 * b);
+            dst[k] = (float)(int32_t)bits;
+        }
+    } else if (raw_data) {
         if (raw_len != (size_t)(numel * 4)) { free(fvals); return FE_ERR_SHAPE; }
         memcpy(e->tensor->data, raw_data, raw_len);
     } else if (n_fvals > 0) {
@@ -311,6 +402,7 @@ static FeStatus parse_initializer(FePbReader *r, FeGraph *g,
  *   1 = name    (string)
  *   2 = f       (float)
  *   3 = i       (int64)
+ *   4 = s       (bytes — a short string such as a mode name)
  *   7 = floats  (repeated float)
  *   8 = ints    (repeated int64)
  */
@@ -322,7 +414,19 @@ typedef struct {
     float float_val;
     int  has_i;
     int  has_f;
+    char str[32];
+    int  has_s;
 } FeAttr;
+
+/* Set by apply_attr when an attribute asks for something the kernels cannot
+ * do; parse_node turns it into a load failure. */
+static int s_attr_unsupported;
+
+/* Where each kept input of each node sat in the ONNX node's input list. ONNX
+ * marks an omitted optional input with an empty name, which is dropped here,
+ * so position is the only way to tell Resize's `scales` from its `sizes`.
+ * Used only between parsing and resolve_constant_inputs. */
+static unsigned char s_input_pos[FE_MAX_NODES][FE_MAX_NODE_INPUTS];
 
 /* Parse a single AttributeProto sub-message into *a. */
 static void parse_attr(FePbReader *r, FeAttr *a) {
@@ -347,6 +451,7 @@ static void parse_attr(FePbReader *r, FeAttr *a) {
                 break;
             }
             case 3: a->int_val = (int)fe_pb_varint(r); a->has_i = 1; break;
+            case 4: pb_string(r, a->str, sizeof(a->str)); a->has_s = 1; break;
             case 8: /* ints — repeated varint */
                 if (a->n_ints < 8)
                     a->ints[a->n_ints++] = (int)fe_pb_varint(r);
@@ -373,8 +478,14 @@ static void apply_attr(FeNode *node, FeOpType op,
                 break;
             case FE_OP_CONV2D:
                 if (strcmp(a->name, "pads") == 0 && a->n_ints >= 4) {
+                    /* ONNX order: top, left, bottom, right. */
                     node->attrs.conv2d.pad_h = a->ints[0];
-                    node->attrs.conv2d.pad_w = a->ints[2];
+                    node->attrs.conv2d.pad_w = a->ints[1];
+                    if (a->ints[2] != a->ints[0] || a->ints[3] != a->ints[1]) {
+                        fprintf(stderr, "ONNX: Conv with different padding on "
+                                "opposite sides is not supported\n");
+                        s_attr_unsupported = 1;
+                    }
                 } else if (strcmp(a->name, "pads") == 0 && a->n_ints >= 2) {
                     node->attrs.conv2d.pad_h = a->ints[0];
                     node->attrs.conv2d.pad_w = a->ints[1];
@@ -403,14 +514,30 @@ static void apply_attr(FeNode *node, FeOpType op,
                     node->attrs.pool.sh = a->ints[0];
                     node->attrs.pool.sw = a->ints[0];
                 }
-                if (strcmp(a->name, "pads") == 0 && a->n_ints > 0) {
-                    int nonzero = 0;
-                    for (int k = 0; k < a->n_ints; k++)
-                        if (a->ints[k] != 0) nonzero = 1;
-                    if (nonzero)
-                        fprintf(stderr,
-                                "ONNX: warning: pool 'pads' not supported, "
-                                "ignoring\n");
+                if (strcmp(a->name, "pads") == 0 && a->n_ints >= 4) {
+                    node->attrs.pool.ph = a->ints[0];
+                    node->attrs.pool.pw = a->ints[1];
+                    if (a->ints[2] != a->ints[0] || a->ints[3] != a->ints[1]) {
+                        fprintf(stderr, "ONNX: pooling with different padding "
+                                "on opposite sides is not supported\n");
+                        s_attr_unsupported = 1;
+                    }
+                }
+                break;
+            case FE_OP_PAD:
+                /* Opset < 11 carries pads as an attribute; later ones as an
+                 * input, read in resolve_constant_inputs. Order: N, C, H, W
+                 * begins, then the four ends. */
+                if (strcmp(a->name, "pads") == 0 && a->n_ints == 8) {
+                    if (a->ints[0] || a->ints[1] || a->ints[4] || a->ints[5]) {
+                        fprintf(stderr, "ONNX: Pad on the batch or channel "
+                                "dimension is not supported\n");
+                        s_attr_unsupported = 1;
+                    }
+                    node->attrs.pad.top    = a->ints[2];
+                    node->attrs.pad.left   = a->ints[3];
+                    node->attrs.pad.bottom = a->ints[6];
+                    node->attrs.pad.right  = a->ints[7];
                 }
                 break;
             default: break;
@@ -419,6 +546,83 @@ static void apply_attr(FeNode *node, FeOpType op,
     }
 
     switch (op) {
+        case FE_OP_CONV2D:
+            if (strcmp(a->name, "dilations") == 0 && a->n_ints >= 2) {
+                node->attrs.conv2d.dil_h = a->ints[0];
+                node->attrs.conv2d.dil_w = a->ints[1];
+            }
+            if (strcmp(a->name, "group") == 0 && a->has_i)
+                node->attrs.conv2d.groups = a->int_val;
+            if (strcmp(a->name, "auto_pad") == 0 && a->has_s &&
+                strcmp(a->str, "NOTSET") != 0) {
+                fprintf(stderr, "ONNX: Conv auto_pad=%s is not supported "
+                        "(export with explicit pads)\n", a->str);
+                s_attr_unsupported = 1;
+            }
+            break;
+        case FE_OP_MAXPOOL:
+        case FE_OP_AVGPOOL:
+            if ((strcmp(a->name, "ceil_mode") == 0 && a->has_i && a->int_val != 0) ||
+                (strcmp(a->name, "count_include_pad") == 0 && a->has_i && a->int_val != 0) ||
+                (strcmp(a->name, "auto_pad") == 0 && a->has_s &&
+                 strcmp(a->str, "NOTSET") != 0)) {
+                fprintf(stderr, "ONNX: pooling attribute '%s' is not supported\n",
+                        a->name);
+                s_attr_unsupported = 1;
+            }
+            if (strcmp(a->name, "dilations") == 0)
+                for (int k = 0; k < a->n_ints; k++)
+                    if (a->ints[k] != 1) {
+                        fprintf(stderr, "ONNX: dilated pooling is not supported\n");
+                        s_attr_unsupported = 1;
+                    }
+            break;
+        case FE_OP_CONCAT:
+            if (strcmp(a->name, "axis") == 0 && a->has_i)
+                node->attrs.concat.axis = a->int_val;
+            break;
+        case FE_OP_RESIZE:
+            if (strcmp(a->name, "mode") == 0 && a->has_s) {
+                if (strcmp(a->str, "linear") == 0)
+                    node->attrs.resize.mode = FE_RESIZE_LINEAR;
+                else if (strcmp(a->str, "nearest") == 0)
+                    node->attrs.resize.mode = FE_RESIZE_NEAREST;
+                else {
+                    fprintf(stderr, "ONNX: Resize mode '%s' is not supported\n", a->str);
+                    s_attr_unsupported = 1;
+                }
+            }
+            if (strcmp(a->name, "coordinate_transformation_mode") == 0 && a->has_s) {
+                if (strcmp(a->str, "half_pixel") == 0)
+                    node->attrs.resize.coord = FE_RESIZE_HALF_PIXEL;
+                else if (strcmp(a->str, "align_corners") == 0)
+                    node->attrs.resize.coord = FE_RESIZE_ALIGN_CORNERS;
+                else if (strcmp(a->str, "asymmetric") == 0)
+                    node->attrs.resize.coord = FE_RESIZE_ASYMMETRIC;
+                else {
+                    fprintf(stderr, "ONNX: Resize coordinate mode '%s' is not "
+                            "supported\n", a->str);
+                    s_attr_unsupported = 1;
+                }
+            }
+            break;
+        case FE_OP_CLIP:           /* opset < 11 keeps the bounds as attributes */
+            if (strcmp(a->name, "min") == 0 && a->has_f) node->attrs.clip.min = a->float_val;
+            if (strcmp(a->name, "max") == 0 && a->has_f) node->attrs.clip.max = a->float_val;
+            break;
+        case FE_OP_PAD:
+            if (strcmp(a->name, "mode") == 0 && a->has_s) {
+                if (strcmp(a->str, "constant") == 0)     node->attrs.pad.mode = FE_PAD_CONSTANT;
+                else if (strcmp(a->str, "reflect") == 0) node->attrs.pad.mode = FE_PAD_REFLECT;
+                else if (strcmp(a->str, "edge") == 0)    node->attrs.pad.mode = FE_PAD_EDGE;
+                else {
+                    fprintf(stderr, "ONNX: Pad mode '%s' is not supported\n", a->str);
+                    s_attr_unsupported = 1;
+                }
+            }
+            if (strcmp(a->name, "value") == 0 && a->has_f)
+                node->attrs.pad.value = a->float_val;
+            break;
         case FE_OP_LEAKY_RELU:
             if (strcmp(a->name, "alpha") == 0 && a->has_f)
                 node->attrs.leaky_relu.negative_slope = a->float_val;
@@ -497,6 +701,8 @@ static FeStatus parse_node(FePbReader *r, FeGraph *g) {
     int      inputs [FE_MAX_NODE_INPUTS];
     int      outputs[FE_MAX_NODE_OUTPUTS];
     int      n_in = 0, n_out = 0;
+    int      in_pos[FE_MAX_NODE_INPUTS];
+    int      n_seen_in = 0;         /* inputs listed, including omitted ones */
     FeAttr   attrs[FE_MAX_ATTRIBUTES];
     int      n_attrs = 0;
     int      kernel_dims = 0;
@@ -509,9 +715,18 @@ static FeStatus parse_node(FePbReader *r, FeGraph *g) {
             case 1: {
                 char tname[FE_NAME_LEN];
                 pb_string(r, tname, FE_NAME_LEN);
-                if (n_in < FE_MAX_NODE_INPUTS) {
+                int pos = n_seen_in++;
+                if (tname[0] == '\0') break;        /* omitted optional input */
+                if (n_in >= FE_MAX_NODE_INPUTS) {
+                    /* Dropping an input would run a different computation. */
+                    fprintf(stderr, "ONNX: a node has more than %d inputs\n",
+                            FE_MAX_NODE_INPUTS);
+                    return FE_ERR_SHAPE;
+                }
+                {
                     int t = find_or_add_tensor(g, tname);
                     if (t < 0) return FE_ERR_NOMEM;   /* registry exhausted */
+                    in_pos[n_in] = pos;
                     inputs[n_in++] = t;
                 }
                 break;
@@ -568,12 +783,28 @@ static FeStatus parse_node(FePbReader *r, FeGraph *g) {
     }
 
     FeNode *node = &g->nodes[idx];
+    for (int i = 0; i < n_in; i++)
+        s_input_pos[idx][i] = (unsigned char)in_pos[i];
 
     /* Per-op default attribute values (attrs union is zeroed at init). */
     switch (op) {
         case FE_OP_CONV2D:
             node->attrs.conv2d.stride_h = 1;
             node->attrs.conv2d.stride_w = 1;
+            node->attrs.conv2d.dil_h = 1;
+            node->attrs.conv2d.dil_w = 1;
+            node->attrs.conv2d.groups = 1;
+            break;
+        case FE_OP_CONCAT:
+            node->attrs.concat.axis = 1;
+            break;
+        case FE_OP_RESIZE:
+            node->attrs.resize.mode  = FE_RESIZE_NEAREST;      /* ONNX defaults */
+            node->attrs.resize.coord = FE_RESIZE_HALF_PIXEL;
+            break;
+        case FE_OP_CLIP:
+            node->attrs.clip.min = -FLT_MAX;
+            node->attrs.clip.max =  FLT_MAX;
             break;
         case FE_OP_MAXPOOL:
         case FE_OP_AVGPOOL:
@@ -603,8 +834,49 @@ static FeStatus parse_node(FePbReader *r, FeGraph *g) {
         default: break;
     }
 
+    s_attr_unsupported = 0;
     for (int i = 0; i < n_attrs; i++)
         apply_attr(node, op, &attrs[i]);
+    if (s_attr_unsupported) return FE_ERR_SHAPE;
+
+    /* ReduceMean is only the global average pool: over H and W, keeping them. */
+    if (strcmp(op_str, "ReduceMean") == 0) {
+        int ok = 0;
+        for (int i = 0; i < n_attrs; i++) {
+            if (strcmp(attrs[i].name, "axes") == 0 && attrs[i].n_ints == 2 &&
+                ((attrs[i].ints[0] == 2 && attrs[i].ints[1] == 3) ||
+                 (attrs[i].ints[0] == -2 && attrs[i].ints[1] == -1)))
+                ok = 1;
+        }
+        for (int i = 0; i < n_attrs; i++)
+            if (strcmp(attrs[i].name, "keepdims") == 0 && attrs[i].has_i &&
+                attrs[i].int_val != 1)
+                ok = 0;
+        if (!ok || n_in != 1) {
+            fprintf(stderr, "ONNX: ReduceMean is supported only over axes [2, 3] "
+                    "with keepdims=1 (a global average pool)\n");
+            return FE_ERR_SHAPE;
+        }
+    }
+    if (op == FE_OP_RESIZE && node->attrs.resize.mode == FE_RESIZE_NEAREST &&
+        node->attrs.resize.coord != FE_RESIZE_ASYMMETRIC) {
+        fprintf(stderr, "ONNX: nearest Resize is supported only with "
+                "coordinate_transformation_mode=asymmetric\n");
+        return FE_ERR_SHAPE;
+    }
+    if (op == FE_OP_PRELU && n_in != 2) {
+        fprintf(stderr, "ONNX: PRelu requires a slope input\n");
+        return FE_ERR_SHAPE;
+    }
+    if (op == FE_OP_CONV2D &&
+        (node->attrs.conv2d.dil_h < 1 || node->attrs.conv2d.dil_w < 1 ||
+         node->attrs.conv2d.groups < 1 || node->attrs.conv2d.stride_h < 1 ||
+         node->attrs.conv2d.stride_w < 1 || node->attrs.conv2d.pad_h < 0 ||
+         node->attrs.conv2d.pad_w < 0)) {
+        fprintf(stderr, "ONNX: Conv has an out-of-range stride, pad, dilation "
+                "or group\n");
+        return FE_ERR_SHAPE;
+    }
 
     /* Required attributes and inputs must be present — fail loudly. */
     switch (op) {
@@ -809,6 +1081,92 @@ static FeStatus parse_graph(FePbReader *r, FeGraph *g,
     return FE_OK;
 }
 
+/* The constant tensor wired to ONNX input position `pos` of node `idx`, or NULL
+ * when that input was omitted. Sets *bad when it is present but not constant. */
+static const FeTensor *constant_input(const FeGraph *g, int idx, int pos, int *bad) {
+    const FeNode *n = &g->nodes[idx];
+    for (int k = 0; k < n->n_inputs; k++) {
+        if (s_input_pos[idx][k] != pos) continue;
+        const FeTensorEntry *e = &g->tensors[n->inputs[k]];
+        if (!e->is_weight || !e->tensor) { *bad = 1; return NULL; }
+        return e->tensor;
+    }
+    return NULL;
+}
+
+/*
+ * Resize, Pad and Clip take their sizes, pads and bounds as inputs. The kernels
+ * need them before any data flows (they fix output shapes), so they must be
+ * constants; this copies them into the node's attributes and leaves the node
+ * with its one data input. Runs once every initializer has been read.
+ */
+static FeStatus resolve_constant_inputs(FeGraph *g) {
+    for (int i = 0; i < g->n_nodes; i++) {
+        FeNode *n = &g->nodes[i];
+        int bad = 0;
+        if (n->op == FE_OP_RESIZE) {
+            const FeTensor *scales = constant_input(g, i, 2, &bad);
+            const FeTensor *sizes  = constant_input(g, i, 3, &bad);
+            if (!bad && sizes && fe_tensor_numel(sizes) == 4) {
+                const float *v = (const float *)sizes->data;
+                n->attrs.resize.out_h = (int)v[2];
+                n->attrs.resize.out_w = (int)v[3];
+                if (n->attrs.resize.out_h < 1 || n->attrs.resize.out_w < 1) bad = 1;
+            } else if (!bad && scales && fe_tensor_numel(scales) == 4) {
+                const float *v = (const float *)scales->data;
+                if (v[0] != 1.0f || v[1] != 1.0f || !(v[2] > 0.0f) || !(v[3] > 0.0f))
+                    bad = 1;
+                n->attrs.resize.scale_h = v[2];
+                n->attrs.resize.scale_w = v[3];
+            } else {
+                bad = 1;
+            }
+            if (bad) {
+                fprintf(stderr, "ONNX: Resize '%s' needs constant 4-element "
+                        "sizes or scales that leave batch and channels alone\n",
+                        n->name);
+                return FE_ERR_SHAPE;
+            }
+            n->n_inputs = 1;
+        } else if (n->op == FE_OP_PAD) {
+            const FeTensor *pads  = constant_input(g, i, 1, &bad);
+            const FeTensor *value = constant_input(g, i, 2, &bad);
+            if (!bad && constant_input(g, i, 3, &bad)) bad = 1;   /* axes input */
+            if (!bad && pads) {
+                const float *v = (const float *)pads->data;
+                if (fe_tensor_numel(pads) != 8 || v[0] != 0 || v[1] != 0 ||
+                    v[4] != 0 || v[5] != 0) bad = 1;
+                else {
+                    n->attrs.pad.top    = (int)v[2];
+                    n->attrs.pad.left   = (int)v[3];
+                    n->attrs.pad.bottom = (int)v[6];
+                    n->attrs.pad.right  = (int)v[7];
+                }
+            }
+            if (!bad && value) n->attrs.pad.value = ((const float *)value->data)[0];
+            if (n->attrs.pad.top < 0 || n->attrs.pad.left < 0 ||
+                n->attrs.pad.bottom < 0 || n->attrs.pad.right < 0) bad = 1;
+            if (bad) {
+                fprintf(stderr, "ONNX: Pad '%s' needs constant, non-negative pads "
+                        "on H and W only\n", n->name);
+                return FE_ERR_SHAPE;
+            }
+            n->n_inputs = 1;
+        } else if (n->op == FE_OP_CLIP) {
+            const FeTensor *lo = constant_input(g, i, 1, &bad);
+            const FeTensor *hi = constant_input(g, i, 2, &bad);
+            if (bad) {
+                fprintf(stderr, "ONNX: Clip '%s' needs constant bounds\n", n->name);
+                return FE_ERR_SHAPE;
+            }
+            if (lo) n->attrs.clip.min = ((const float *)lo->data)[0];
+            if (hi) n->attrs.clip.max = ((const float *)hi->data)[0];
+            n->n_inputs = 1;
+        }
+    }
+    return FE_OK;
+}
+
 /*
  * Flag Softmax nodes whose axis is provably not the last one.
  *
@@ -894,6 +1252,8 @@ FeStatus fe_onnx_load(FeGraph *graph, FeArena *weight_arena,
 
     free(buf);
 
+    if (status == FE_OK)
+        status = resolve_constant_inputs(graph);
     if (status == FE_OK)
         status = fe_graph_topo_sort(graph);
     if (status == FE_OK)

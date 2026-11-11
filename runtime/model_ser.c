@@ -115,6 +115,15 @@ static FeStatus read_f32le(FILE *f, float *v) {
 
 static FeStatus write_attrs(FILE *f, const FeNode *n) {
     FeStatus s;
+    /* The artifact format predates dilation, groups, pool padding and the
+     * vision operators and has no fields for them. Writing such a node would
+     * silently drop what makes it correct, so refuse. */
+    if (n->op >= FE_OP_CONCAT) return FE_ERR_DTYPE;
+    if (n->op == FE_OP_CONV2D &&
+        (n->attrs.conv2d.dil_h > 1 || n->attrs.conv2d.dil_w > 1 ||
+         n->attrs.conv2d.groups > 1)) return FE_ERR_DTYPE;
+    if ((n->op == FE_OP_MAXPOOL || n->op == FE_OP_AVGPOOL) &&
+        (n->attrs.pool.ph > 0 || n->attrs.pool.pw > 0)) return FE_ERR_DTYPE;
     switch (n->op) {
         case FE_OP_CONV1D:
             s = write_u32le(f, (uint32_t)n->attrs.conv1d.stride);
