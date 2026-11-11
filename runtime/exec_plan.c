@@ -214,7 +214,12 @@ FeStatus fe_exec_required_bytes(FeExecPlan *ep, FeRuntime *rt,
     ep->input_dynamic |= dynamic;
     s = fe_plan_memory(g, &ep->plan);
     if (s != FE_OK) return s;
-    *bytes = ep->plan.total_activation_bytes;
+    /* fe_plan_apply carves tensor data and then one FeTensor header per planned
+     * tensor out of the same buffer, after aligning the data block. */
+    size_t header = (sizeof(FeTensor) + _Alignof(FeTensor) - 1) / _Alignof(FeTensor)
+                    * _Alignof(FeTensor);
+    *bytes = ep->plan.total_activation_bytes + (size_t)ep->plan.n_lifetimes * header
+             + FERRITE_PLANNER_ALIGN + _Alignof(FeTensor);
     ep->plan_valid = 0;          /* fe_exec_run re-plans against its own buffer */
     return FE_OK;
 }

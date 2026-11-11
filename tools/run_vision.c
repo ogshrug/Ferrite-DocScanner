@@ -130,9 +130,19 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Size the activation buffer exactly as an app would, so a wrong estimate
+     * shows up here as an allocation failure. */
     size_t need = 0;
-    if (fe_runtime_required_bytes(&rt, input, &need) == FE_OK)
-        fprintf(stderr, "activations: %.1f MB\n", need / 1048576.0);
+    if (fe_runtime_required_bytes(&rt, input, &need) != FE_OK || need > ACT_BUF_SIZE) {
+        fprintf(stderr, "run_vision: cannot size the activations\n");
+        return 1;
+    }
+    fprintf(stderr, "activations: %.1f MB\n", need / 1048576.0);
+    if (fe_runtime_init(&rt, g, (char *)weight_buf + used, WEIGHT_BUF_SIZE - used,
+                        act_buf, need) != FE_OK) {
+        fprintf(stderr, "run_vision: runtime init failed\n");
+        return 1;
+    }
 
     FeTensor *output = fe_tensor_alloc(DTYPE_FLOAT32, out_ndim, out_dims);
     double *times = malloc(sizeof(double) * (size_t)runs);
