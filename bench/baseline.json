@@ -1,14 +1,14 @@
 {
   "bench": "bench_avx2 (model-independent microbench)",
   "elem_avx2_checksum": 549756000000.0,
-  "elem_avx2_ms": 0.19,
+  "elem_avx2_ms": 0.132,
   "elem_naive_checksum": 549756000000.0,
-  "elem_naive_ms": 0.747,
-  "elem_speedup": 3.92,
-  "gemm_base_ms": 1.412,
-  "gemm_speedup": 15.65,
-  "gemm_transb_ms": 22.087,
-  "matmul_avx2_ms": 1.447,
-  "matmul_naive_ms": 6.919,
-  "matmul_speedup": 4.78
+  "elem_naive_ms": 0.331,
+  "elem_speedup": 2.5,
+  "gemm_base_ms": 0.31,
+  "gemm_speedup": 52.45,
+  "gemm_transb_ms": 16.242,
+  "matmul_avx2_ms": 0.312,
+  "matmul_naive_ms": 5.375,
+  "matmul_speedup": 17.23
 }
